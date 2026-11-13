@@ -1,0 +1,21 @@
+[package]
+name = "disciples2_rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+pollster = "1.0.1"
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# The wgpu major version is chosen to match glyphon 0.12 (planned GPU text rendering),
+# which depends on wgpu 30. Upgrade both together.
+wgpu = "30.0.2"
+# Latest stable winit; 0.31 is still in beta.
+winit = "0.30.13"
+
+# wgpu/naga are very slow without optimizations. Optimize dependencies in dev builds so
+# debug runs stay interactive; our own crate keeps opt-level 0 for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 2
