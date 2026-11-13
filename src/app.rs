@@ -10,14 +10,16 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::window::{Window, WindowId};
+use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::engine::render::{FrameStatus, GpuContext};
 use crate::engine::time::{FrameClock, FrameStats};
 
 const WINDOW_TITLE: &str = "Disciples2Rust";
+/// Windowed-mode size, used after leaving the default fullscreen (F11 / Alt+Enter).
 const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 720.0);
 const MIN_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 360.0);
 /// Linear RGB (the surface is sRGB): a near-black, slightly violet background.
@@ -38,6 +40,7 @@ pub struct App {
     stats: FrameStats,
     /// True while drawing is paused because the window has no drawable area.
     paused: bool,
+    modifiers: ModifiersState,
     fatal_error: Option<anyhow::Error>,
 }
 
@@ -49,6 +52,7 @@ impl App {
             clock: FrameClock::default(),
             stats: FrameStats::new(FRAME_STATS_INTERVAL),
             paused: false,
+            modifiers: ModifiersState::default(),
             fatal_error: None,
         }
     }
@@ -66,11 +70,13 @@ impl App {
 
     fn init_graphics(&mut self, event_loop: &ActiveEventLoop) -> anyhow::Result<()> {
         // Created hidden and shown after the first presented frame, so the OS never
-        // shows an unpainted (white) client area.
+        // shows an unpainted (white) client area. Borderless fullscreen on the current
+        // monitor by default: no video-mode switch, fast Alt+Tab.
         let attributes = Window::default_attributes()
             .with_title(WINDOW_TITLE)
             .with_inner_size(INITIAL_WINDOW_SIZE)
             .with_min_inner_size(MIN_WINDOW_SIZE)
+            .with_fullscreen(Some(Fullscreen::Borderless(None)))
             .with_visible(false);
         let window = Arc::new(
             event_loop
@@ -135,6 +141,18 @@ impl App {
         }
     }
 
+    fn toggle_fullscreen(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let next = match window.fullscreen() {
+            Some(_) => None,
+            None => Some(Fullscreen::Borderless(None)),
+        };
+        tracing::info!(fullscreen = next.is_some(), "toggling fullscreen");
+        window.set_fullscreen(next);
+    }
+
     fn resized(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
@@ -186,6 +204,24 @@ impl ApplicationHandler for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 tracing::info!(scale_factor, "window scale factor changed");
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                // Synthetic presses replay keys held while focus was elsewhere.
+                if !is_synthetic
+                    && is_fullscreen_toggle(
+                        event.physical_key,
+                        event.state,
+                        event.repeat,
+                        self.modifiers.alt_key(),
+                    )
+                {
+                    self.toggle_fullscreen();
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
         }
@@ -201,4 +237,54 @@ fn create_gpu_context(
         event_loop.owned_display_handle(),
     ))
     .context("failed to initialize GPU rendering")
+}
+
+/// F11, or Alt+Enter (the Windows convention), toggles fullscreen. Key repeats are
+/// ignored so holding the keys does not flip between modes.
+fn is_fullscreen_toggle(key: PhysicalKey, state: ElementState, repeat: bool, alt: bool) -> bool {
+    if state != ElementState::Pressed || repeat {
+        return false;
+    }
+    match key {
+        PhysicalKey::Code(KeyCode::F11) => true,
+        PhysicalKey::Code(KeyCode::Enter | KeyCode::NumpadEnter) => alt,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRESSED: ElementState = ElementState::Pressed;
+    const F11: PhysicalKey = PhysicalKey::Code(KeyCode::F11);
+    const ENTER: PhysicalKey = PhysicalKey::Code(KeyCode::Enter);
+
+    #[test]
+    fn f11_press_toggles_with_or_without_alt() {
+        assert!(is_fullscreen_toggle(F11, PRESSED, false, false));
+        assert!(is_fullscreen_toggle(F11, PRESSED, false, true));
+    }
+
+    #[test]
+    fn enter_toggles_only_with_alt() {
+        assert!(!is_fullscreen_toggle(ENTER, PRESSED, false, false));
+        assert!(is_fullscreen_toggle(ENTER, PRESSED, false, true));
+        let numpad_enter = PhysicalKey::Code(KeyCode::NumpadEnter);
+        assert!(is_fullscreen_toggle(numpad_enter, PRESSED, false, true));
+    }
+
+    #[test]
+    fn releases_repeats_and_other_keys_are_ignored() {
+        assert!(!is_fullscreen_toggle(
+            F11,
+            ElementState::Released,
+            false,
+            false
+        ));
+        assert!(!is_fullscreen_toggle(F11, PRESSED, true, false));
+        assert!(!is_fullscreen_toggle(ENTER, PRESSED, true, true));
+        let space = PhysicalKey::Code(KeyCode::Space);
+        assert!(!is_fullscreen_toggle(space, PRESSED, false, true));
+    }
 }
