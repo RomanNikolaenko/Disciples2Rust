@@ -1,5 +1,6 @@
 mod app;
 mod engine;
+mod game;
 
 use anyhow::Context as _;
 use tracing_subscriber::EnvFilter;

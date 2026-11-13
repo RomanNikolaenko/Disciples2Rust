@@ -29,7 +29,16 @@ pub enum RenderInitError {
     NoSurfaceFormat { adapter: String },
 }
 
-/// What happened to a frame requested via [`GpuContext::draw_frame`].
+/// GPU handles and the surface view for encoding one frame (sizes in physical pixels).
+pub struct FrameTarget<'a> {
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+    pub view: &'a wgpu::TextureView,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// What happened to a frame requested via [`GpuContext::render_frame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameStatus {
     /// The frame was submitted and presented.
@@ -178,8 +187,25 @@ impl GpuContext {
         }
     }
 
-    /// Clears the surface to `clear_color` (linear RGB) and presents it.
-    pub fn draw_frame(&mut self, clear_color: wgpu::Color) -> FrameStatus {
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Format of the presentation surface (sRGB when available, see module docs).
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
+    /// Acquires the next surface texture, lets `encode` record the frame's passes, then
+    /// submits and presents. Nothing is encoded when the surface is unavailable.
+    pub fn render_frame(
+        &mut self,
+        encode: impl FnOnce(&FrameTarget<'_>, &mut wgpu::CommandEncoder),
+    ) -> FrameStatus {
         if !self.surface_configured {
             return FrameStatus::SurfaceUnavailable;
         }
@@ -198,21 +224,14 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
-        {
-            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-        }
+        let target = FrameTarget {
+            device: &self.device,
+            queue: &self.queue,
+            view: &view,
+            width: frame.texture.width(),
+            height: frame.texture.height(),
+        };
+        encode(&target, &mut encoder);
 
         self.queue.submit([encoder.finish()]);
         self.window.pre_present_notify();

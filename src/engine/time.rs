@@ -2,6 +2,10 @@
 
 use std::time::{Duration, Instant};
 
+/// Upper bound for the time step fed into animations. After a stall (debugger, window
+/// drag, focus change) animations advance by at most this much instead of jumping.
+pub const MAX_ANIMATION_STEP: Duration = Duration::from_millis(100);
+
 /// Measures the time between consecutive frames using a monotonic clock.
 ///
 /// Callers pass `now` explicitly so the logic is deterministic in tests.

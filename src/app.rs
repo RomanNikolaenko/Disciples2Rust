@@ -1,41 +1,40 @@
 //! Application lifecycle: main window, GPU context and per-frame flow.
 //!
-//! Per-frame order (AGENTS.md): collect input → dispatch UI/input → update game state →
-//! fixed simulation → animation → prepare render data → encode/submit. Only frame timing
-//! and the final clear/present exist so far.
+//! Per-frame order (AGENTS.md): input events are dispatched to the menu as they arrive;
+//! on redraw: frame timing → menu update/animation → build UI frame → encode/submit.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use crate::engine::assets::assets_dir;
+use crate::engine::render::ui_renderer::{UiFrame, UiRenderer};
 use crate::engine::render::{FrameStatus, GpuContext};
-use crate::engine::time::{FrameClock, FrameStats};
+use crate::engine::time::{FrameClock, FrameStats, MAX_ANIMATION_STEP};
+use crate::game::menus::main_menu::{MainMenu, MenuEvent};
 
 const WINDOW_TITLE: &str = "Disciples2Rust";
 /// Windowed-mode size, used after leaving the default fullscreen (F11 / Alt+Enter).
 const INITIAL_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(1280.0, 720.0);
 const MIN_WINDOW_SIZE: LogicalSize<f64> = LogicalSize::new(640.0, 360.0);
-/// Linear RGB (the surface is sRGB): a near-black, slightly violet background.
-const CLEAR_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.010,
-    g: 0.008,
-    b: 0.016,
-    a: 1.0,
-};
 const FRAME_STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct App {
-    // Field order matters for drop order: the GPU context (and its surface) is dropped
-    // before the window it presents to.
+    // Field order matters for drop order: UI resources and the GPU context (and its
+    // surface) are dropped before the window they present to.
+    menu: Option<MainMenu>,
+    renderer: Option<UiRenderer>,
     gpu: Option<GpuContext>,
     window: Option<Arc<Window>>,
+    /// Render list rebuilt every frame; kept to reuse its allocations.
+    ui_frame: UiFrame,
     clock: FrameClock,
     stats: FrameStats,
     /// True while drawing is paused because the window has no drawable area.
@@ -47,8 +46,11 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
+            menu: None,
+            renderer: None,
             gpu: None,
             window: None,
+            ui_frame: UiFrame::default(),
             clock: FrameClock::default(),
             stats: FrameStats::new(FRAME_STATS_INTERVAL),
             paused: false,
@@ -89,15 +91,54 @@ impl App {
             "main window created"
         );
 
-        let mut gpu = create_gpu_context(event_loop, &window)?;
-        gpu.draw_frame(CLEAR_COLOR);
+        self.init_rendering(event_loop, &window)?;
+        // The menu starts fully transparent, so this first frame shows the background.
+        self.draw();
         window.set_visible(true);
 
         event_loop.set_control_flow(ControlFlow::Wait);
         window.request_redraw();
         self.window = Some(window);
+        Ok(())
+    }
+
+    /// (Re)creates the GPU context and everything that owns GPU resources.
+    fn init_rendering(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window: &Arc<Window>,
+    ) -> anyhow::Result<()> {
+        self.menu = None;
+        self.renderer = None;
+        self.gpu = None;
+        let gpu = create_gpu_context(event_loop, window)?;
+        let mut renderer = UiRenderer::new(gpu.device(), gpu.queue(), gpu.surface_format());
+        let size = window.inner_size();
+        let menu = MainMenu::new(
+            &gpu,
+            &mut renderer,
+            &assets_dir(),
+            [size.width, size.height],
+        );
+        self.menu = Some(menu);
+        self.renderer = Some(renderer);
         self.gpu = Some(gpu);
         Ok(())
+    }
+
+    /// Builds this frame's UI and renders it. `None` if rendering is not initialized.
+    fn draw(&mut self) -> Option<FrameStatus> {
+        let (Some(gpu), Some(renderer), Some(menu)) = (
+            self.gpu.as_mut(),
+            self.renderer.as_mut(),
+            self.menu.as_ref(),
+        ) else {
+            return None;
+        };
+        self.ui_frame.clear();
+        menu.build_frame(&mut self.ui_frame);
+        let frame = &self.ui_frame;
+        Some(gpu.render_frame(|target, encoder| renderer.render(target, encoder, frame)))
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -111,19 +152,15 @@ impl App {
         };
 
         if self.gpu.as_ref().is_some_and(GpuContext::is_device_lost) {
-            // No other GPU resources exist yet, so recovery is a full context rebuild.
-            tracing::warn!("recreating the GPU context after device loss");
-            self.gpu = None;
-            match create_gpu_context(event_loop, &window) {
-                Ok(gpu) => self.gpu = Some(gpu),
-                Err(error) => return self.fail(event_loop, error),
+            // All GPU resources are gone: rebuild the context, renderer and menu.
+            tracing::warn!("recreating rendering after GPU device loss");
+            if let Err(error) = self.init_rendering(event_loop, &window) {
+                return self.fail(event_loop, error);
             }
         }
-        let Some(gpu) = self.gpu.as_mut() else {
-            return;
-        };
 
-        if let Some(frame_time) = self.clock.tick(Instant::now())
+        let frame_time = self.clock.tick(Instant::now());
+        if let Some(frame_time) = frame_time
             && let Some(summary) = self.stats.record(frame_time)
         {
             tracing::debug!(
@@ -133,11 +170,20 @@ impl App {
                 "frame timing"
             );
         }
+        let dt = frame_time.unwrap_or_default().min(MAX_ANIMATION_STEP);
 
-        match gpu.draw_frame(CLEAR_COLOR) {
-            FrameStatus::Presented | FrameStatus::Skipped => window.request_redraw(),
+        if let Some(menu) = self.menu.as_mut()
+            && let Some(MenuEvent::Exit) = menu.update(dt.as_secs_f32())
+        {
+            event_loop.exit();
+            return;
+        }
+
+        match self.draw() {
+            Some(FrameStatus::Presented | FrameStatus::Skipped) => window.request_redraw(),
             // Stop the redraw loop until a non-zero resize; see `resized`.
-            FrameStatus::SurfaceUnavailable => self.paused = true,
+            Some(FrameStatus::SurfaceUnavailable) => self.paused = true,
+            None => {}
         }
     }
 
@@ -153,11 +199,14 @@ impl App {
         window.set_fullscreen(next);
     }
 
-    fn resized(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+    fn resized(&mut self, size: PhysicalSize<u32>) {
         let Some(gpu) = self.gpu.as_mut() else {
             return;
         };
         gpu.resize(size);
+        if let Some(menu) = self.menu.as_mut() {
+            menu.resize([size.width, size.height]);
+        }
         let has_area = size.width > 0 && size.height > 0;
         if !has_area {
             // Pause here rather than waiting for a redraw: Windows delivers no redraws
@@ -205,6 +254,28 @@ impl ApplicationHandler for App {
                 tracing::info!(scale_factor, "window scale factor changed");
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.pointer_moved(position.x as f32, position.y as f32);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.pointer_left();
+                }
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                if let Some(menu) = self.menu.as_mut() {
+                    match state {
+                        ElementState::Pressed => menu.pointer_pressed(),
+                        ElementState::Released => menu.pointer_released(),
+                    }
+                }
+            }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic,
