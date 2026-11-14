@@ -79,7 +79,6 @@ pub struct UiKit {
     pub fade_right: TextureSetId,
     pub knob: TextureSetId,
     pub brush: TextureSetId,
-    pub ornament_side: TextureSetId,
     pub ornament_divider: TextureSetId,
     /// Option selector arrow, pointing left (mirrored for the right arrow).
     pub arrow: TextureSetId,
@@ -136,15 +135,6 @@ impl UiKit {
                     &ui_dir.join("brush_underline.webp"),
                     [1, 1],
                     [196, 104, 40, 255],
-                ),
-                None,
-            ),
-            ornament_side: upload(
-                "ornament side",
-                &load_color(
-                    &ui_dir.join("ornament_side.webp"),
-                    [1, 1],
-                    [215, 193, 163, 255],
                 ),
                 None,
             ),
@@ -293,6 +283,170 @@ pub fn canvas_scaled(scale: f32, origin: [f32; 2], x: f32, y: f32, w: f32, h: f3
     rect.x += origin[0];
     rect.y += origin[1];
     rect
+}
+
+/// A plain rectangular button in the stone buttons' colors: their stone (cropped from
+/// `button_base.webp`, without the ornaments) and label colors, inside a thin bronze
+/// border that warms up on hover. A disabled button darkens the same way a disabled
+/// stone button does.
+pub struct FlatButton {
+    label: LabelId,
+    rect: Rect,
+    pub enabled: bool,
+    hover: Tween,
+    press: Tween,
+}
+
+/// Size of a [`FlatButton`] (reference pixels) and its label size: the main menu's
+/// Update button and the Credits screen's Back button.
+pub const FLAT_BUTTON_SIZE: [f32; 2] = [220.0, 38.0];
+pub const FLAT_BUTTON_TEXT_SIZE: f32 = 17.0;
+/// sRGB border of a disabled [`FlatButton`] (enabled: [`palette::ROW_LINE`], warming
+/// to [`palette::HEADING`] on hover).
+const FLAT_BORDER_DISABLED: [u8; 4] = [60, 45, 27, 255];
+/// Raises a [`FlatButton`] label by this fraction of its font size. Labels are centered
+/// by their line box, which keeps room above the letters (for capitals and accents), so
+/// the letters themselves sit low; measured on screen, this centers them.
+const FLAT_LABEL_RAISE: f32 = 0.13;
+/// The frame's pointed ends reach a little past the 9-slice borders into the stone;
+/// the flat button's stone is taken this many texels further in.
+const STONE_ORNAMENT_CLEARANCE: f32 = 60.0;
+
+impl FlatButton {
+    /// The label text is set at runtime with [`Self::set_text`].
+    pub fn new(renderer: &mut UiRenderer) -> Self {
+        Self {
+            label: renderer.create_label("", TextStyle::CENTERED),
+            rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+            enabled: false,
+            hover: Tween::new(0.0),
+            press: Tween::new(0.0),
+        }
+    }
+
+    pub fn place(&mut self, rect: Rect) {
+        self.rect = rect;
+    }
+
+    pub fn set_text(&self, renderer: &mut UiRenderer, text: &str) {
+        renderer.set_label_text(self.label, text);
+    }
+
+    pub fn is_interactive(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn hit_target(&self, id: usize) -> HitTarget<'static> {
+        HitTarget {
+            id,
+            shape: HitShape::Rectangle(self.rect),
+            interactive: self.enabled,
+        }
+    }
+
+    pub fn animate(&mut self, hovered: bool, pressed: bool, dt: f32) {
+        let active = self.enabled && hovered;
+        let (target, duration) = if active {
+            (1.0, HOVER_IN)
+        } else {
+            (0.0, HOVER_OUT)
+        };
+        self.hover
+            .animate_to(target, duration, Easing::EaseOutCubic);
+        self.hover.update(dt);
+        let press = if self.enabled && pressed { 1.0 } else { 0.0 };
+        self.press
+            .animate_to(press, PRESS_DURATION, Easing::EaseOutCubic);
+        self.press.update(dt);
+    }
+
+    pub fn reset_animation(&mut self) {
+        self.hover.set(0.0);
+        self.press.set(0.0);
+    }
+
+    pub fn draw(&self, frame: &mut UiFrame, kit: &UiKit, font_size: f32) {
+        let rect = self.rect;
+        // Border in whole pixels, scaling with the button.
+        let border = (rect.h / 26.0).round().max(1.0);
+        let hover = self.hover.value() * (1.0 - 0.5 * self.press.value());
+        let border_color = if self.enabled {
+            mix_srgb(palette::ROW_LINE, palette::HEADING, hover)
+        } else {
+            FLAT_BORDER_DISABLED
+        };
+        let sprites = &mut frame.group_sprites;
+        push_flat(sprites, kit, rect, border_color);
+        let stone = inset(rect, border);
+        let art = &kit.button;
+        sprites.push(Sprite {
+            textures: art.textures,
+            shape: SpriteShape::Stretched {
+                rect: stone,
+                uv: stone_uv(art.size, [stone.w, stone.h]),
+            },
+            material: SpriteMaterial {
+                press_amount: self.press.value(),
+                disabled_amount: if self.enabled { 0.0 } else { 1.0 },
+                ..SpriteMaterial::PLAIN
+            },
+        });
+        let text = if self.enabled {
+            palette::TEXT
+        } else {
+            palette::TEXT_DISABLED
+        };
+        let raise = (font_size * FLAT_LABEL_RAISE).round();
+        let label_rect = Rect::new(rect.x, rect.y - raise, rect.w, rect.h);
+        push_label(frame, self.label, label_rect, font_size, text, true);
+    }
+}
+
+/// `rect` shrunk by `by` on every side.
+fn inset(rect: Rect, by: f32) -> Rect {
+    Rect::new(
+        rect.x + by,
+        rect.y + by,
+        (rect.w - 2.0 * by).max(0.0),
+        (rect.h - 2.0 * by).max(0.0),
+    )
+}
+
+/// Texture rectangle of plain stone in the button art (inside the frame, clear of the
+/// end ornaments), centered and cropped to the aspect of `size` so the stone is not
+/// stretched.
+fn stone_uv(art_size: [f32; 2], size: [f32; 2]) -> Rect {
+    let left = BUTTON_BORDERS.left + STONE_ORNAMENT_CLEARANCE;
+    let right = BUTTON_BORDERS.right + STONE_ORNAMENT_CLEARANCE;
+    let plain = [
+        art_size[0] - left - right,
+        art_size[1] - BUTTON_BORDERS.top - BUTTON_BORDERS.bottom,
+    ];
+    let aspect = size[0] / size[1];
+    if !(aspect.is_finite() && aspect > 0.0 && plain[0] > 0.0 && plain[1] > 0.0) {
+        return FULL_UV;
+    }
+    let [w, h] = if plain[0] / plain[1] > aspect {
+        [plain[1] * aspect, plain[1]]
+    } else {
+        [plain[0], plain[0] / aspect]
+    };
+    let x = left + (plain[0] - w) / 2.0;
+    let y = BUTTON_BORDERS.top + (plain[1] - h) / 2.0;
+    Rect::new(
+        x / art_size[0],
+        y / art_size[1],
+        w / art_size[0],
+        h / art_size[1],
+    )
+}
+
+/// Blends two sRGB colors (`t` = 0 → `a`, 1 → `b`).
+fn mix_srgb(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
+    let t = t.clamp(0.0, 1.0);
+    std::array::from_fn(|i| {
+        (f32::from(a[i]) + (f32::from(b[i]) - f32::from(a[i])) * t).round() as u8
+    })
 }
 
 /// The textured stone button with a crystal glow on hover.
@@ -955,6 +1109,25 @@ pub fn slider_value(track: Rect, x: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flat_button_stone_is_plain_and_unstretched() {
+        let art = [1410.0, 342.0];
+        for size in [[208.0, 28.0], [60.0, 40.0], [500.0, 20.0]] {
+            let uv = stone_uv(art, size);
+            // Inside the frame and between the ornaments.
+            let clear = STONE_ORNAMENT_CLEARANCE;
+            assert!(uv.x * art[0] >= BUTTON_BORDERS.left + clear - 1e-3);
+            assert!((uv.x + uv.w) * art[0] <= art[0] - BUTTON_BORDERS.right - clear + 1e-3);
+            assert!(uv.y * art[1] >= BUTTON_BORDERS.top - 1e-3);
+            assert!((uv.y + uv.h) * art[1] <= art[1] - BUTTON_BORDERS.bottom + 1e-3);
+            // Same shape as the button: no stretching.
+            let shape = (uv.w * art[0]) / (uv.h * art[1]);
+            assert!((shape - size[0] / size[1]).abs() < 1e-3, "{size:?}");
+        }
+        assert_eq!(stone_uv(art, [10.0, 0.0]), FULL_UV);
+        assert_eq!(inset(Rect::new(0.0, 0.0, 3.0, 3.0), 2.0).w, 0.0);
+    }
 
     #[test]
     fn slider_value_maps_and_clamps() {

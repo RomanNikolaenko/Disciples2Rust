@@ -3,3 +3,4 @@
 pub mod locale;
 pub mod menus;
 pub mod settings;
+pub mod update;

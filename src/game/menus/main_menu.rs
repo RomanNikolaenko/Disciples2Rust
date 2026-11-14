@@ -12,8 +12,9 @@
 //! - `button_glow_mask.webp`: same size, grayscale, linear; its solid part marks the
 //!   crystals, which light up on hover. The light stays inside them (no halo).
 //!
-//! The background, panel shade, slider knob, ornaments and brush underline are
-//! placeholders from `examples/generate_placeholder_assets.rs`.
+//! The background is the painting `menu_background.png`, animated by [`MenuBackground`].
+//! The panel shade, slider knob, ornaments and brush underline are placeholders from
+//! `examples/generate_placeholder_assets.rs`.
 //!
 //! Screens switch through [`ScreenFlow`]: the whole group fades out, the screen changes,
 //! then it fades back in. Settings and Credits darken the background with an overlay
@@ -22,29 +23,41 @@
 use std::path::Path;
 use std::time::Instant;
 
+use super::background::MenuBackground;
 use super::credits_screen::CreditsScreen;
 use super::screen_flow::{FlowEvent, ScreenFlow, Transition};
 use super::settings_screen::{SettingsEvent, SettingsScreen, WHEEL_LINE};
 use super::widgets::{
-    self, DIALOG_CANCEL, DIALOG_CONFIRM, Dialog, FULL_UV, StoneButton, UiKit, palette, scaled,
+    self, DIALOG_CANCEL, DIALOG_CONFIRM, Dialog, FLAT_BUTTON_SIZE, FLAT_BUTTON_TEXT_SIZE, FULL_UV,
+    FlatButton, StoneButton, UiKit, palette, scaled,
 };
 use crate::engine::render::GpuContext;
 use crate::engine::render::ui_renderer::{SpriteMaterial, TextureSetId, UiFrame, UiRenderer};
-use crate::engine::ui::geometry::{Rect, cover_uv};
+use crate::engine::ui::geometry::Rect;
 use crate::engine::ui::hit::{Hit, topmost_hit};
 use crate::engine::ui::pointer::{PointerPosition, PointerRouter};
 use crate::game::locale::Language;
 use crate::game::settings::{DisplayInfo, DisplaySettings, Settings};
+use crate::game::update::{UpdateState, Updater};
 
 const REFERENCE_SIZE: [f32; 2] = [1920.0, 1080.0];
 const MENU_LEFT: f32 = 110.0;
-const MENU_TOP: f32 = 430.0;
-/// Close to the art's natural aspect (1410x342 → 330x80), so the stone barely stretches.
-const BUTTON_SIZE: [f32; 2] = [336.0, 80.0];
-const BUTTON_PITCH: f32 = 90.0;
+/// Top of the main column, so that the column is centered vertically.
+const MENU_TOP: f32 = (REFERENCE_SIZE[1] - column_height()) / 2.0;
+/// Lower than the art's natural aspect (1410x342 → 264x64): the 9-slice keeps the end
+/// ornaments' proportions (they scale with the height) and stretches only the stone.
+const BUTTON_SIZE: [f32; 2] = [336.0, 64.0];
+/// Button height plus a 10 px gap.
+const BUTTON_PITCH: f32 = 74.0;
 /// Extra space before buttons that start a new section (e.g. Exit).
 const SECTION_GAP: f32 = 28.0;
 const PANEL_WIDTH: f32 = 780.0;
+/// Update button (a plain one): width and height, reference pixels.
+const UPDATE_SIZE: [f32; 2] = FLAT_BUTTON_SIZE;
+/// Its gap to the screen's bottom edge and to its right edge (the same), reference
+/// pixels.
+const UPDATE_MARGIN: f32 = 16.0;
+const UPDATE_TEXT_SIZE: f32 = FLAT_BUTTON_TEXT_SIZE;
 const LABEL_SIZE: f32 = 26.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +121,8 @@ const MAIN_BUTTONS: [ButtonSpec; 5] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuEvent {
     Exit,
+    /// An update was installed: start the new version and quit.
+    Restart,
     /// The player applied settings: propagate them, and persist them when `save` (a
     /// window change is saved only once the player keeps it).
     SettingsApplied {
@@ -120,11 +135,14 @@ pub enum MenuEvent {
 /// [`DIALOG_CONFIRM`](super::widgets::DIALOG_CONFIRM) / `DIALOG_CANCEL`. Main buttons use
 /// ids 0..4, so this stays clear of them.
 const EXIT_DIALOG_ID: usize = 100;
+/// Hit id of the Update button (right after the main buttons).
+const UPDATE_ID: usize = MAIN_BUTTONS.len();
+/// Hit id base of the update confirmation's buttons.
+const UPDATE_DIALOG_ID: usize = 110;
 
 pub struct MainMenu {
     kit: UiKit,
-    background: TextureSetId,
-    background_size: [f32; 2],
+    background: MenuBackground,
     panel: TextureSetId,
     /// Same order as [`MAIN_BUTTONS`].
     main_buttons: Vec<StoneButton>,
@@ -133,6 +151,16 @@ pub struct MainMenu {
     /// "Exit the game?" confirmation; opens instead of quitting right away.
     exit_dialog: Dialog,
     exit_dialog_open: bool,
+    updater: Updater,
+    /// The updater's state as of this frame.
+    update_state: UpdateState,
+    /// Bottom-right: lights up when a newer release can be installed.
+    update_button: FlatButton,
+    /// "Install the update?" confirmation.
+    update_dialog: Dialog,
+    update_dialog_open: bool,
+    /// The restart after an installed update was requested (only once).
+    restart_requested: bool,
     flow: ScreenFlow<Screen>,
     router: PointerRouter,
     pointer: PointerPosition,
@@ -155,22 +183,13 @@ impl MainMenu {
         viewport: [u32; 2],
         settings: Settings,
         display: DisplayInfo,
+        updater: Updater,
     ) -> Self {
         let (device, queue) = (gpu.device(), gpu.queue());
         let ui_dir = assets_dir.join("ui");
         let kit = UiKit::load(gpu, renderer, &ui_dir);
 
-        let background_image = widgets::load_color(
-            &ui_dir.join("menu_background.webp"),
-            [1, 1],
-            [24, 26, 32, 255],
-        );
-        let background_size = [
-            background_image.width as f32,
-            background_image.height as f32,
-        ];
-        let background =
-            renderer.create_texture_set(device, queue, "menu background", &background_image, None);
+        let background = MenuBackground::load(gpu, renderer, &ui_dir);
         let panel_image = widgets::load_color(
             &ui_dir.join("menu_panel_shade.webp"),
             [1, 1],
@@ -186,17 +205,25 @@ impl MainMenu {
         let settings = SettingsScreen::new(renderer, settings, display);
         let credits = CreditsScreen::new(renderer);
         let exit_dialog = Dialog::new(renderer, "Exit the game?", ["Exit", "Cancel"]);
+        let update_button = FlatButton::new(renderer);
+        let update_dialog = Dialog::new(renderer, "Install the update?", ["Update", "Cancel"]);
+        let update_state = updater.state();
 
         let mut menu = Self {
             kit,
             background,
-            background_size,
             panel,
             main_buttons,
             settings,
             credits,
             exit_dialog,
             exit_dialog_open: false,
+            updater,
+            update_state,
+            update_button,
+            update_dialog,
+            update_dialog_open: false,
+            restart_requested: false,
             flow: ScreenFlow::new(Screen::Main),
             router: PointerRouter::default(),
             pointer: PointerPosition::default(),
@@ -225,8 +252,12 @@ impl MainMenu {
             button.place(rect, &self.kit.button);
         }
         self.settings.layout(self.scale, self.viewport, &self.kit);
-        self.credits.layout(self.scale, self.viewport, &self.kit);
+        self.credits.layout(self.scale, self.viewport);
         self.exit_dialog
+            .layout(self.scale, self.viewport, &self.kit);
+        self.update_button
+            .place(update_button_rect(self.scale, self.viewport));
+        self.update_dialog
             .layout(self.scale, self.viewport, &self.kit);
         self.refresh_hover();
     }
@@ -331,6 +362,27 @@ impl MainMenu {
                         }
                         _ => {}
                     }
+                } else if self.update_dialog_open {
+                    match id.checked_sub(UPDATE_DIALOG_ID) {
+                        Some(DIALOG_CONFIRM) => {
+                            self.update_dialog_open = false;
+                            self.focus = None;
+                            tracing::info!("update confirmed");
+                            self.updater.install();
+                        }
+                        Some(DIALOG_CANCEL) => {
+                            self.update_dialog_open = false;
+                            self.focus = None;
+                        }
+                        _ => {}
+                    }
+                } else if id == UPDATE_ID {
+                    // Installing asks first; its buttons take the focus.
+                    if update_button_text(&self.update_state, Language::English).1 {
+                        self.update_dialog_open = true;
+                        self.update_dialog.show();
+                        self.focus = Some(UPDATE_DIALOG_ID + DIALOG_CONFIRM);
+                    }
                 } else {
                     match MAIN_BUTTONS.get(id).map(|spec| spec.command) {
                         Some(Command::OpenSettings) => {
@@ -414,9 +466,19 @@ impl MainMenu {
                         EXIT_DIALOG_ID + DIALOG_CANCEL,
                     ];
                 }
-                (0..MAIN_BUTTONS.len())
+                if self.update_dialog_open {
+                    return vec![
+                        UPDATE_DIALOG_ID + DIALOG_CONFIRM,
+                        UPDATE_DIALOG_ID + DIALOG_CANCEL,
+                    ];
+                }
+                let mut stops: Vec<usize> = (0..MAIN_BUTTONS.len())
                     .filter(|&index| self.main_buttons[index].is_interactive())
-                    .collect()
+                    .collect();
+                if self.update_button.is_interactive() {
+                    stops.push(UPDATE_ID);
+                }
+                stops
             }
             Screen::Settings => self.settings.focus_stops(),
             Screen::Credits => self.credits.focus_stops(),
@@ -454,8 +516,9 @@ impl MainMenu {
         match self.flow.current() {
             // The exit dialog closes on Escape; the main screen has nothing to leave.
             Screen::Main => {
-                if self.exit_dialog_open {
+                if self.exit_dialog_open || self.update_dialog_open {
                     self.exit_dialog_open = false;
+                    self.update_dialog_open = false;
                     self.focus = None;
                     self.router.reset();
                     self.refresh_hover();
@@ -497,16 +560,19 @@ impl MainMenu {
 
     /// Advances animations by `dt` seconds and reports what the application must do.
     pub fn update(&mut self, dt: f32) -> Option<MenuEvent> {
+        self.background.update(dt);
         match self.flow.update(dt) {
             FlowEvent::None => {}
             FlowEvent::ScreenChanged => {
                 let screen = self.flow.current();
                 tracing::debug!(?screen, "menu screen changed");
                 match screen {
-                    Screen::Main => self
-                        .main_buttons
-                        .iter_mut()
-                        .for_each(StoneButton::reset_animation),
+                    Screen::Main => {
+                        self.main_buttons
+                            .iter_mut()
+                            .for_each(StoneButton::reset_animation);
+                        self.update_button.reset_animation();
+                    }
                     Screen::Settings => self.settings.open(),
                     Screen::Credits => self.credits.open(),
                 }
@@ -527,21 +593,38 @@ impl MainMenu {
             }
         }
 
+        self.update_state = self.updater.state();
+        self.update_button.enabled = update_button_text(&self.update_state, Language::English).1;
+        if matches!(self.update_state, UpdateState::Installed { .. }) && !self.restart_requested {
+            self.restart_requested = true;
+            return Some(MenuEvent::Restart);
+        }
+
         // The focused widget glows like a hovered one.
         let hovered = self.router.hovered().or(self.focus);
         let pressed = self.router.pressed_visual();
         match self.flow.current() {
             Screen::Main => {
+                let modal = self.exit_dialog_open || self.update_dialog_open;
                 for (index, button) in self.main_buttons.iter_mut().enumerate() {
                     button.animate(
-                        !self.exit_dialog_open && hovered == Some(index),
-                        !self.exit_dialog_open && pressed == Some(index),
+                        !modal && hovered == Some(index),
+                        !modal && pressed == Some(index),
                         dt,
                     );
                 }
+                self.update_button.animate(
+                    !modal && hovered == Some(UPDATE_ID),
+                    !modal && pressed == Some(UPDATE_ID),
+                    dt,
+                );
                 if self.exit_dialog_open {
                     self.exit_dialog
                         .animate(hovered, pressed, EXIT_DIALOG_ID, dt);
+                }
+                if self.update_dialog_open {
+                    self.update_dialog
+                        .animate(hovered, pressed, UPDATE_DIALOG_ID, dt);
                 }
             }
             Screen::Settings => {
@@ -562,17 +645,13 @@ impl MainMenu {
         }
         let [width, height] = self.viewport;
         let full = Rect::new(0.0, 0.0, width, height);
-        widgets::push_image(
-            &mut frame.background,
-            self.background,
-            full,
-            cover_uv(self.background_size, self.viewport),
-            background_material(
-                &self
-                    .settings
-                    .display_preview(self.flow.current() == Screen::Settings),
-            ),
+        let calibration = background_material(
+            &self
+                .settings
+                .display_preview(self.flow.current() == Screen::Settings),
         );
+        self.background
+            .draw(&mut frame.background, self.viewport, calibration);
         widgets::push_image(
             &mut frame.background,
             self.panel,
@@ -588,8 +667,19 @@ impl MainMenu {
                 for button in &self.main_buttons {
                     button.draw(frame, &self.kit.button, label_size);
                 }
+                let (text, _) = update_button_text(&self.update_state, language);
+                self.update_button.set_text(renderer, &text);
+                let update_size = (UPDATE_TEXT_SIZE * self.scale).round();
+                self.update_button.draw(frame, &self.kit, update_size);
                 if self.exit_dialog_open {
                     self.exit_dialog.draw(frame, &self.kit);
+                }
+                if self.update_dialog_open {
+                    if let Some(version) = update_version(&self.update_state) {
+                        let message = language.update_message(&version);
+                        self.update_dialog.set_message(renderer, &message);
+                    }
+                    self.update_dialog.draw(frame, &self.kit);
                 }
             }
             Screen::Settings => {
@@ -612,6 +702,7 @@ impl MainMenu {
         self.settings.relabel(renderer, language);
         self.credits.relabel(renderer, language);
         self.exit_dialog.relabel(renderer, language);
+        self.update_dialog.relabel(renderer, language);
         self.shown_language = Some(language);
         tracing::info!(?language, "interface language set");
     }
@@ -623,17 +714,24 @@ impl MainMenu {
                 if self.exit_dialog_open {
                     return self.exit_dialog.hit_test(x, y, &self.kit, EXIT_DIALOG_ID);
                 }
+                if self.update_dialog_open {
+                    return self
+                        .update_dialog
+                        .hit_test(x, y, &self.kit, UPDATE_DIALOG_ID);
+                }
+                let update = self.update_button.hit_target(UPDATE_ID);
                 topmost_hit(
                     self.main_buttons
                         .iter()
                         .enumerate()
-                        .map(|(index, button)| button.hit_target(index, &self.kit.button)),
+                        .map(|(index, button)| button.hit_target(index, &self.kit.button))
+                        .chain([update]),
                     x,
                     y,
                 )
             }
             Screen::Settings => self.settings.hit_test(x, y, &self.kit),
-            Screen::Credits => self.credits.hit_test(x, y, &self.kit),
+            Screen::Credits => self.credits.hit_test(x, y),
         }
     }
 
@@ -663,6 +761,41 @@ fn next_focus(stops: &[usize], current: Option<usize>, backwards: bool) -> Optio
     Some(stops[index])
 }
 
+/// The Update button's text in `language`, and whether it can be pressed (to install,
+/// or to retry a failed install).
+fn update_button_text(state: &UpdateState, language: Language) -> (String, bool) {
+    let fixed = |english| (language.tr(english).to_owned(), false);
+    match state {
+        UpdateState::Checking => fixed("Checking…"),
+        UpdateState::UpToDate => fixed("Up to date"),
+        UpdateState::CheckFailed => fixed("Updates"),
+        UpdateState::Available {
+            release,
+            installable: true,
+        } => (language.update_to(&release.version.to_string()), true),
+        UpdateState::Available { release, .. } => (
+            language.update_available(&release.version.to_string()),
+            false,
+        ),
+        UpdateState::Downloading { progress, .. } => {
+            let percent = (progress.clamp(0.0, 1.0) * 100.0).round() as u32;
+            (language.downloading(percent), false)
+        }
+        UpdateState::Installed { .. } => fixed("Restarting…"),
+        UpdateState::Failed { .. } => (language.tr("Retry update").to_owned(), true),
+    }
+}
+
+/// The version being offered, for the confirmation's message.
+fn update_version(state: &UpdateState) -> Option<String> {
+    match state {
+        UpdateState::Available { release, .. } | UpdateState::Failed { release } => {
+            Some(release.version.to_string())
+        }
+        _ => None,
+    }
+}
+
 /// The background stands in for the game image: brightness and gamma calibrate it
 /// (linear light), while the interface keeps its colors.
 fn background_material(display: &DisplaySettings) -> SpriteMaterial {
@@ -677,6 +810,30 @@ fn background_material(display: &DisplaySettings) -> SpriteMaterial {
 /// Uniform UI scale relative to the 1920x1080 reference.
 fn ui_scale(viewport: [f32; 2]) -> f32 {
     (viewport[0] / REFERENCE_SIZE[0]).min(viewport[1] / REFERENCE_SIZE[1])
+}
+
+/// The update button: in the screen's bottom-right corner with the same gap below and
+/// to the right. Anchored to the viewport rather than the 1920x1080 reference, which
+/// stops short of the corner on screens wider or taller than 16:9. Whole pixels (the
+/// viewport is in whole physical pixels).
+fn update_button_rect(scale: f32, viewport: [f32; 2]) -> Rect {
+    let margin = (UPDATE_MARGIN * scale).round();
+    let [w, h] = UPDATE_SIZE.map(|side| (side * scale).round());
+    Rect::new(viewport[0] - margin - w, viewport[1] - margin - h, w, h)
+}
+
+/// Height of the main column: the buttons, their pitch and the section gaps.
+const fn column_height() -> f32 {
+    let mut height = BUTTON_SIZE[1];
+    let mut index = 1;
+    while index < MAIN_BUTTONS.len() {
+        height += BUTTON_PITCH;
+        if MAIN_BUTTONS[index].starts_section {
+            height += SECTION_GAP;
+        }
+        index += 1;
+    }
+    height
 }
 
 /// Places the main column of buttons, snapped to whole pixels.
@@ -712,19 +869,22 @@ mod tests {
     fn column_applies_pitch_and_section_gap() {
         let rects = layout_column(MAIN_BUTTONS.iter().map(|spec| spec.starts_section), 1.0);
         let ys: Vec<f32> = rects.iter().map(|r| r.y).collect();
-        assert_eq!(ys, [430.0, 520.0, 610.0, 700.0, 818.0]);
+        assert_eq!(ys, [346.0, 420.0, 494.0, 568.0, 670.0]);
         assert!(
             rects
                 .iter()
-                .all(|r| r.x == 110.0 && r.w == 336.0 && r.h == 80.0)
+                .all(|r| r.x == 110.0 && r.w == 336.0 && r.h == 64.0)
         );
         assert!(rects[4].y + rects[4].h <= 1080.0, "Exit stays on screen");
+        // Centered vertically: equal space above and below.
+        let below = REFERENCE_SIZE[1] - (rects[4].y + rects[4].h);
+        assert_eq!(rects[0].y, below);
     }
 
     #[test]
     fn column_scales() {
         let rects = layout_column([false].into_iter(), 0.5);
-        assert_eq!(rects[0], Rect::new(55.0, 215.0, 168.0, 40.0));
+        assert_eq!(rects[0], Rect::new(55.0, 173.0, 168.0, 32.0));
     }
 
     #[test]
@@ -779,6 +939,80 @@ mod tests {
     #[test]
     fn exit_dialog_ids_stay_clear_of_the_main_buttons() {
         assert!(EXIT_DIALOG_ID >= MAIN_BUTTONS.len());
+        const { assert!(UPDATE_ID < EXIT_DIALOG_ID) };
+        const { assert!(UPDATE_DIALOG_ID >= EXIT_DIALOG_ID + 2) };
+    }
+
+    #[test]
+    fn update_button_sits_in_the_bottom_right_corner() {
+        assert_eq!(
+            update_button_rect(1.0, REFERENCE_SIZE),
+            Rect::new(1684.0, 1026.0, 220.0, 38.0)
+        );
+        for viewport in [
+            [1920.0, 1080.0],
+            [1527.0, 793.0],
+            [2560.0, 1080.0],
+            [1280.0, 1024.0],
+            [3840.0, 2160.0],
+        ] {
+            let scale = ui_scale(viewport);
+            let rect = update_button_rect(scale, viewport);
+            let right_gap = viewport[0] - (rect.x + rect.w);
+            let bottom_gap = viewport[1] - (rect.y + rect.h);
+            assert_eq!(
+                right_gap, bottom_gap,
+                "{viewport:?}: same gap right and below"
+            );
+            assert_eq!(right_gap, (UPDATE_MARGIN * scale).round());
+            assert_eq!([rect.x, rect.y], [rect.x.round(), rect.y.round()]);
+            let column_right = ((MENU_LEFT + BUTTON_SIZE[0]) * scale).round();
+            assert!(
+                rect.x > column_right,
+                "{viewport:?}: clear of the main column"
+            );
+        }
+    }
+
+    #[test]
+    fn update_button_is_active_only_with_something_to_install() {
+        use crate::game::update::Version;
+        let uk = Language::Ukrainian;
+        assert_eq!(
+            update_button_text(&UpdateState::Checking, uk),
+            ("Перевірка…".to_owned(), false)
+        );
+        assert!(!update_button_text(&UpdateState::UpToDate, uk).1);
+        assert!(!update_button_text(&UpdateState::CheckFailed, uk).1);
+        let version = Version::parse("v0.2.0").unwrap();
+        let downloading = UpdateState::Downloading {
+            version,
+            progress: 0.426,
+        };
+        assert_eq!(
+            update_button_text(&downloading, uk),
+            ("Завантаження 43%".to_owned(), false)
+        );
+        assert_eq!(
+            update_button_text(&UpdateState::Installed { version }, Language::English).0,
+            "Restarting…"
+        );
+    }
+
+    #[test]
+    fn update_texts_are_translated() {
+        for text in [
+            "Checking…",
+            "Up to date",
+            "Updates",
+            "Restarting…",
+            "Retry update",
+            "Install the update?",
+            "Update",
+        ] {
+            assert!(crate::game::locale::is_translated(text), "{text}");
+        }
+        assert_eq!(Language::Ukrainian.update_to("v0.2.0"), "Оновити до v0.2.0");
     }
 
     #[test]

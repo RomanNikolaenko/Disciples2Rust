@@ -26,11 +26,13 @@ use crate::engine::render::ui_renderer::{
 use crate::engine::render::{FrameStatus, GpuContext};
 use crate::engine::time::{FpsCounter, FrameClock, FrameStats, MAX_ANIMATION_STEP};
 use crate::engine::ui::geometry::Rect;
+use crate::game::locale::UI_FONTS;
 use crate::game::menus::main_menu::{MainMenu, MenuEvent};
 use crate::game::settings::{
     AspectRatio, DisplayInfo, DisplayMode, DisplaySettings, MonitorInfo, Settings, VideoMode,
     settings_path,
 };
+use crate::game::update::{self, Updater};
 
 const WINDOW_TITLE: &str = "Disciples2Rust";
 /// Smallest supported window client area, matching [`MIN_RESOLUTION`] in the display
@@ -65,6 +67,8 @@ pub struct App {
     /// Single source of truth for user settings; saved when the player applies changes.
     settings: Settings,
     settings_path: Option<PathBuf>,
+    /// Checks for and installs game updates in the background.
+    updater: Updater,
     /// Extra size the window frame adds over the client area, so a windowed window is
     /// never larger than its screen; see [`DisplayInfo::windowed_max`].
     window_frame: [u32; 2],
@@ -75,6 +79,9 @@ impl App {
     pub fn new() -> Self {
         let settings_path = settings_path();
         let settings = Settings::load_or_default(settings_path.as_deref());
+        // The previous version has exited by now: its leftovers can go.
+        update::clean_up_previous_update();
+        let updater = Updater::start();
         Self {
             menu: None,
             renderer: None,
@@ -91,6 +98,7 @@ impl App {
             fps_label: None,
             settings,
             settings_path,
+            updater,
             window_frame: [0, 0],
             fatal_error: None,
         }
@@ -187,7 +195,11 @@ impl App {
         self.gpu = None;
         self.fps_label = None;
         let gpu = create_gpu_context(event_loop, window, self.settings.display.vsync)?;
-        let mut renderer = UiRenderer::new(gpu.device(), gpu.queue(), gpu.surface_format());
+        let fonts: Vec<PathBuf> = UI_FONTS
+            .iter()
+            .map(|font| assets_dir().join(font))
+            .collect();
+        let mut renderer = UiRenderer::new(gpu.device(), gpu.queue(), gpu.surface_format(), &fonts);
         let size = window.inner_size();
         // An older settings file may keep an aspect ratio this monitor cannot display.
         snap_aspect_ratio(
@@ -201,6 +213,7 @@ impl App {
             [size.width, size.height],
             self.settings,
             display_info(&window_monitors(window), self.window_frame),
+            self.updater.clone(),
         );
         self.menu = Some(menu);
         self.renderer = Some(renderer);
@@ -289,6 +302,14 @@ impl App {
                 event_loop.exit();
                 return;
             }
+            Some(MenuEvent::Restart) => match update::restart() {
+                Ok(()) => {
+                    tracing::info!("restarting into the updated game");
+                    event_loop.exit();
+                    return;
+                }
+                Err(error) => tracing::error!("{error:#}"),
+            },
             Some(MenuEvent::SettingsApplied { settings, save }) => {
                 self.apply_settings(settings, save);
             }

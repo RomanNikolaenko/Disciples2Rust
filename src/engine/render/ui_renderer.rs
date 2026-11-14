@@ -19,12 +19,14 @@
 //! falls outside; labels use glyphon's text bounds.
 
 use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 use glyphon::cosmic_text::Align;
 use glyphon::{
     Attrs, Buffer, Cache, Color, ColorMode, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight, fontdb,
 };
 
 use super::FrameTarget;
@@ -40,8 +42,8 @@ const SURFACE_CLEAR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 const LINE_HEIGHT_FACTOR: f32 = 1.25;
-/// Preferred sans-serif families, first installed one wins. A bundled font will replace
-/// this lookup.
+/// Sans-serif families to fall back on when no bundled font loads, first installed one
+/// wins.
 const SANS_CANDIDATES: [&str; 7] = [
     "Roboto",
     "Segoe UI",
@@ -303,8 +305,15 @@ pub struct UiRenderer {
 
 impl UiRenderer {
     /// `format` is the surface format; the offscreen group target uses the same format so
-    /// one pipeline and one glyph atlas serve both passes.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+    /// one pipeline and one glyph atlas serve both passes. `fonts` are the game's bundled
+    /// font files: the family of the first one that loads becomes the sans-serif font for
+    /// all labels (installed fonts remain as fallback for characters it lacks).
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        fonts: &[PathBuf],
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ui sprite shader"),
             source: wgpu::ShaderSource::Wgsl(
@@ -448,7 +457,7 @@ impl UiRenderer {
             indices: Vec::new(),
             group_commands: Vec::new(),
             surface_commands: Vec::new(),
-            text: TextLayer::new(device, queue, format),
+            text: TextLayer::new(device, queue, format, fonts),
         }
     }
 
@@ -857,14 +866,23 @@ struct TextLayer {
 }
 
 impl TextLayer {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        fonts: &[PathBuf],
+    ) -> Self {
         let started = std::time::Instant::now();
+        // Installed fonts first: they cover characters the bundled font lacks.
         let mut font_system = FontSystem::new();
-        let family = SANS_CANDIDATES.into_iter().find(|candidate| {
-            font_system
-                .db()
-                .faces()
-                .any(|face| face.families.iter().any(|(name, _)| name == candidate))
+        let bundled = load_bundled_fonts(font_system.db_mut(), fonts);
+        let family = bundled.first().map(String::as_str).or_else(|| {
+            SANS_CANDIDATES.into_iter().find(|candidate| {
+                font_system
+                    .db()
+                    .faces()
+                    .any(|face| face.families.iter().any(|(name, _)| name == candidate))
+            })
         });
         match family {
             Some(family) => font_system.db_mut().set_sans_serif_family(family),
@@ -872,6 +890,7 @@ impl TextLayer {
         }
         tracing::info!(
             sans_serif = family.unwrap_or("default"),
+            bundled = !bundled.is_empty(),
             faces = font_system.db().len(),
             elapsed_ms = started.elapsed().as_millis(),
             "fonts loaded"
@@ -1031,10 +1050,48 @@ impl TextLayer {
     }
 }
 
+/// Loads font files into `db` and returns the families they add, in file order. A file
+/// that cannot be read or parsed is logged and skipped, leaving installed fonts in use.
+pub fn load_bundled_fonts(db: &mut fontdb::Database, paths: &[PathBuf]) -> Vec<String> {
+    let mut families: Vec<String> = Vec::new();
+    for path in paths {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::error!(path = %path.display(), %error, "cannot read bundled font");
+                continue;
+            }
+        };
+        let ids = db.load_font_source(fontdb::Source::Binary(Arc::new(bytes)));
+        if ids.is_empty() {
+            tracing::error!(path = %path.display(), "bundled font has no usable faces");
+        }
+        for id in ids {
+            // The first name is the face's (typographic) family, e.g. "Inter".
+            let family = db.face(id).and_then(|face| face.families.first());
+            if let Some((name, _)) = family
+                && !families.contains(name)
+            {
+                families.push(name.clone());
+            }
+        }
+    }
+    families
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::ui::geometry::NineSlice;
+
+    #[test]
+    fn unreadable_fonts_are_skipped() {
+        let mut db = fontdb::Database::new();
+        let missing = PathBuf::from("no/such/font.ttf");
+        let not_a_font = PathBuf::from(file!());
+        assert!(load_bundled_fonts(&mut db, &[missing, not_a_font]).is_empty());
+        assert_eq!(db.len(), 0);
+    }
 
     fn sprite(textures: usize, shape: SpriteShape) -> Sprite {
         Sprite {

@@ -3,19 +3,16 @@
 //! Everything here is procedural and original; the files are meant to be replaced by real
 //! art with the same names, sizes and channel conventions:
 //!
-//! - `menu_background.webp`   1920x1080 RGB, opaque.
 //! - `menu_panel_shade.webp`  512x8 RGBA, black with a horizontal alpha falloff.
 //! - `slider_knob.webp`       64x64 RGBA: metal diamond frame around a teal gem.
 //! - `slider_knob_glow.webp`  64x64 grayscale, linear: the gem and a soft halo.
-//! - `ornament_side.webp`     256x24 RGBA: gold line ending in a diamond on the left
-//!   (drawn mirrored on the right side of titles).
 //! - `ornament_divider.webp`  512x26 RGBA: gold line with a center diamond.
 //! - `brush_underline.webp`   512x24 RGBA: orange brush stroke fading to the right.
 //! - `selector_arrow.webp`    32x48 RGBA: bronze chevron pointing left (mirrored for the
 //!   right arrow).
 //!
-//! The button art (`button_base.webp`, `button_glow_mask.webp`) is hand-made and is not
-//! touched by this tool.
+//! The button art (`button_base.webp`, `button_glow_mask.webp`) and the menu background
+//! painting (`menu_background.png`) are real art and are not touched by this tool.
 //!
 //! Run with: `cargo run --example generate_placeholder_assets`
 
@@ -31,15 +28,6 @@ const OUT_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ui");
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = Path::new(OUT_DIR);
     std::fs::create_dir_all(out)?;
-
-    let (w, h) = (1920, 1080);
-    write_webp(
-        &out.join("menu_background.webp"),
-        &background(w, h),
-        w,
-        h,
-        ExtendedColorType::Rgb8,
-    )?;
 
     let (w, h) = (512, 8);
     write_webp(
@@ -67,14 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ExtendedColorType::L8,
     )?;
 
-    let (w, h) = (256, 24);
-    write_webp(
-        &out.join("ornament_side.webp"),
-        &ornament_side(w, h),
-        w,
-        h,
-        ExtendedColorType::Rgba8,
-    )?;
     let (w, h) = (512, 26);
     write_webp(
         &out.join("ornament_divider.webp"),
@@ -117,74 +97,6 @@ fn write_webp(
         std::fs::metadata(path)?.len()
     );
     Ok(())
-}
-
-// ---------------------------------------------------------------------------------------
-// Background: a stormy dusk landscape built from noise layers.
-
-fn background(width: u32, height: u32) -> Vec<u8> {
-    let aspect = width as f32 / height as f32;
-    let sun = [0.64, 0.33];
-    let mut out = Vec::with_capacity((width * height * 3) as usize);
-    for row in 0..height {
-        for column in 0..width {
-            let u = (column as f32 + 0.5) / width as f32;
-            let v = (row as f32 + 0.5) / height as f32;
-
-            // Sky gradient, warm haze near the horizon.
-            let mut c = mix3(
-                [16.0, 20.0, 28.0],
-                [58.0, 66.0, 74.0],
-                smoothstep(0.0, 0.45, v),
-            );
-            c = mix3(c, [168.0, 156.0, 128.0], smoothstep(0.38, 0.62, v));
-
-            // Sun glow behind the clouds.
-            let dx = (u - sun[0]) * aspect;
-            let dy = v - sun[1];
-            let sun_dist2 = dx * dx + dy * dy;
-            let sun_glow = (-sun_dist2 / 0.03).exp();
-            c = add3(c, scale3([255.0, 226.0, 170.0], 0.75 * sun_glow));
-
-            // Clouds: warped fbm, denser towards the top, rims lit near the sun.
-            let warp = fbm(u * 2.0 * aspect, v * 2.0, 3, 7);
-            let n = fbm(u * 3.0 * aspect + 1.7 * warp, v * 5.5 + warp, 5, 3);
-            let cover = 1.0 - smoothstep(0.25, 0.62, v);
-            let density = smoothstep(0.42, 0.72, n) * cover;
-            let lit = (-sun_dist2 / 0.09).exp() * (1.0 - smoothstep(0.55, 0.9, n));
-            let cloud = add3([30.0, 33.0, 40.0], scale3([200.0, 182.0, 140.0], lit));
-            c = mix3(c, cloud, 0.88 * density);
-
-            // Hills: three ridge layers with atmospheric perspective.
-            let ridges = [
-                (0.60, 0.045, 3.0, 21, [96.0, 104.0, 108.0]),
-                (0.67, 0.065, 5.0, 22, [52.0, 62.0, 56.0]),
-                (0.79, 0.070, 8.0, 23, [22.0, 29.0, 22.0]),
-            ];
-            for (base_height, amplitude, frequency, seed, color) in ridges {
-                let ridge = base_height - amplitude * fbm(u * frequency * aspect, 0.5, 4, seed);
-                let coverage = smoothstep(ridge - 0.0015, ridge + 0.0015, v);
-                let shade = 1.0 - 0.35 * smoothstep(ridge, ridge + 0.25, v);
-                c = mix3(c, scale3(color, shade), coverage);
-            }
-
-            // Ground texture and a mist band at the horizon.
-            let ground = smoothstep(0.78, 0.82, v);
-            let grass = fbm(u * 60.0 * aspect, v * 140.0, 3, 31) - 0.5;
-            c = scale3(c, 1.0 + 0.4 * grass * ground);
-            let mist = (-((v - 0.645) / 0.03).powi(2)).exp() * 0.45;
-            c = mix3(c, [150.0, 152.0, 146.0], mist);
-
-            // Vignette.
-            let vx = u - 0.5;
-            let vy = v - 0.5;
-            let vignette = 1.0 - 0.55 * smoothstep(0.25, 0.75, (vx * vx + vy * vy).sqrt());
-            c = scale3(c, vignette);
-
-            out.extend_from_slice(&[to_u8(c[0]), to_u8(c[1]), to_u8(c[2])]);
-        }
-    }
-    out
 }
 
 /// Black with alpha fading from dense on the left to clear on the right.
@@ -258,27 +170,6 @@ fn slider_knob(size: u32) -> (Vec<u8>, Vec<u8>) {
         }
     }
     (base, glow)
-}
-
-fn ornament_side(width: u32, height: u32) -> Vec<u8> {
-    let cy = height as f32 / 2.0;
-    let mut out = Vec::with_capacity((width * height * 4) as usize);
-    for row in 0..height {
-        for column in 0..width {
-            let (x, y) = (column as f32 + 0.5, row as f32 + 0.5);
-            let diamond = diamond_outline(x - 14.0, y - cy, 8.0, 1.6);
-            let dot = ((x - 30.0).powi(2) + (y - cy).powi(2)).sqrt() - 2.0;
-            let end_dot = ((x - 250.0).powi(2) + (y - cy).powi(2)).sqrt() - 1.6;
-            let line = if (38.0..246.0).contains(&x) {
-                (y - cy).abs() - 0.8
-            } else {
-                f32::MAX
-            };
-            let d = diamond.min(dot).min(end_dot).min(line);
-            push_rgba(&mut out, GOLD, coverage(d));
-        }
-    }
-    out
 }
 
 fn ornament_divider(width: u32, height: u32) -> Vec<u8> {
@@ -378,10 +269,6 @@ fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         a[1] + (b[1] - a[1]) * t,
         a[2] + (b[2] - a[2]) * t,
     ]
-}
-
-fn add3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
 fn scale3(a: [f32; 3], k: f32) -> [f32; 3] {

@@ -1,7 +1,11 @@
-//! Credits screen: a centered title with side ornaments, credit sections, and a Back to
-//! Menu button (the mockup shows no way back; the button sits where Settings has it).
+//! Credits screen: a centered title, credit sections, and a plain Back to Menu button
+//! like the main menu's Update button (the mockup shows no way back; the button sits
+//! where Settings has its own).
 
-use super::widgets::{self, FULL_UV, StoneButton, UiKit, canvas_origin, canvas_scaled, palette};
+use super::widgets::{
+    self, FLAT_BUTTON_SIZE, FLAT_BUTTON_TEXT_SIZE, FULL_UV, FlatButton, UiKit, canvas_origin,
+    canvas_scaled, palette,
+};
 use crate::engine::render::ui_renderer::{
     LabelId, SpriteMaterial, TextAlign, TextStyle, UiFrame, UiRenderer,
 };
@@ -24,9 +28,6 @@ const COLUMN_WIDTH: f32 = 800.0;
 const TITLE_Y: f32 = 66.0;
 const TITLE_HEIGHT: f32 = 64.0;
 const TITLE_TEXT_SIZE: f32 = 46.0;
-/// Side ornaments: distance of the inner end from the center, and size.
-const SIDE_GAP: f32 = 125.0;
-const SIDE_SIZE: [f32; 2] = [220.0, 22.0];
 const SUBTITLE_DIVIDER: [f32; 3] = [140.0, 300.0, 22.0]; // y, width, height
 const SECTIONS_TOP: f32 = 196.0;
 const HEADING_HEIGHT: f32 = 42.0;
@@ -35,16 +36,13 @@ const SECTION_GAP: f32 = 28.0;
 const HEADING_TEXT_SIZE: f32 = 30.0;
 const NAME_TEXT_SIZE: f32 = 26.0;
 const BOTTOM_DIVIDER: [f32; 3] = [24.0, 520.0, 26.0]; // gap after content, width, height
-const BACK_BUTTON: [f32; 4] = [230.0, 950.0, 336.0, 72.0];
-const BUTTON_TEXT_SIZE: f32 = 24.0;
+/// Back button: left edge and vertical center (where the earlier 72 px high stone
+/// button at y 950 had its center).
+const BACK_BUTTON: [f32; 2] = [230.0, 986.0];
+const BACK_TEXT: &str = "Back to Menu";
 
 const BACK_ID: usize = 0;
 const TITLE: &str = "CREDITS";
-
-// Layout invariants, checked at compile time: "CREDITS" at 46 px is roughly 200 px
-// wide, so the side ornaments must stay clear of it and on screen.
-const _: () = assert!(SIDE_GAP > 110.0);
-const _: () = assert!(CENTER_X - SIDE_GAP - SIDE_SIZE[0] > 0.0);
 
 struct Line {
     label: LabelId,
@@ -57,10 +55,9 @@ struct Line {
 pub struct CreditsScreen {
     title: LabelId,
     lines: Vec<Line>,
-    back: StoneButton,
+    back: FlatButton,
     scale: f32,
     title_rect: Rect,
-    side_rects: [Rect; 2],
     subtitle_divider: Rect,
     bottom_divider: Rect,
 }
@@ -89,15 +86,14 @@ impl CreditsScreen {
             }
         }
         let empty = Rect::new(0.0, 0.0, 0.0, 0.0);
-        let mut back = StoneButton::new(renderer, "Back to Menu", true);
-        back.dark = true;
+        let mut back = FlatButton::new(renderer);
+        back.enabled = true;
         Self {
             title: renderer.create_label(TITLE, TextStyle::CENTERED),
             lines,
             back,
             scale: 1.0,
             title_rect: empty,
-            side_rects: [empty; 2],
             subtitle_divider: empty,
             bottom_divider: empty,
         }
@@ -113,10 +109,10 @@ impl CreditsScreen {
         for line in self.lines.iter().filter(|line| line.heading) {
             renderer.set_label_text(line.label, language.tr(line.text));
         }
-        self.back.relabel(renderer, language);
+        self.back.set_text(renderer, language.tr(BACK_TEXT));
     }
 
-    pub fn layout(&mut self, scale: f32, viewport: [f32; 2], kit: &UiKit) {
+    pub fn layout(&mut self, scale: f32, viewport: [f32; 2]) {
         self.scale = scale;
         // The content is symmetric: center the whole reference canvas in the viewport,
         // not just use the reference coordinates (which center only in a 16:9 window).
@@ -124,12 +120,6 @@ impl CreditsScreen {
         let at = |x, y, w, h| canvas_scaled(scale, origin, x, y, w, h);
         let left = CENTER_X - COLUMN_WIDTH / 2.0;
         self.title_rect = at(left, TITLE_Y, COLUMN_WIDTH, TITLE_HEIGHT);
-        let side_y = TITLE_Y + (TITLE_HEIGHT - SIDE_SIZE[1]) / 2.0;
-        let [side_w, side_h] = SIDE_SIZE;
-        self.side_rects = [
-            at(CENTER_X - SIDE_GAP - side_w, side_y, side_w, side_h),
-            at(CENTER_X + SIDE_GAP, side_y, side_w, side_h),
-        ];
         let [y, w, h] = SUBTITLE_DIVIDER;
         self.subtitle_divider = at(CENTER_X - w / 2.0, y, w, h);
 
@@ -151,12 +141,13 @@ impl CreditsScreen {
         let [gap, w, h] = BOTTOM_DIVIDER;
         self.bottom_divider = at(CENTER_X - w / 2.0, y + gap, w, h);
 
-        let [x, y, w, h] = BACK_BUTTON;
-        self.back.place(at(x, y, w, h), &kit.button);
+        let [x, center_y] = BACK_BUTTON;
+        let [w, h] = FLAT_BUTTON_SIZE;
+        self.back.place(at(x, center_y - h / 2.0, w, h));
     }
 
-    pub fn hit_test(&self, x: f32, y: f32, kit: &UiKit) -> Hit {
-        topmost_hit([self.back.hit_target(BACK_ID, &kit.button)], x, y)
+    pub fn hit_test(&self, x: f32, y: f32) -> Hit {
+        topmost_hit([self.back.hit_target(BACK_ID)], x, y)
     }
 
     /// Returns true when the click asks to go back to the main menu.
@@ -184,23 +175,7 @@ impl CreditsScreen {
             palette::TEXT,
             false,
         );
-        // The side ornament art points left; the right one is mirrored through its UVs.
-        let [left, right] = self.side_rects;
         let sprites = &mut frame.group_sprites;
-        widgets::push_image(
-            sprites,
-            kit.ornament_side,
-            left,
-            FULL_UV,
-            SpriteMaterial::PLAIN,
-        );
-        widgets::push_image(
-            sprites,
-            kit.ornament_side,
-            right,
-            Rect::new(1.0, 0.0, -1.0, 1.0),
-            SpriteMaterial::PLAIN,
-        );
         for divider in [self.subtitle_divider, self.bottom_divider] {
             widgets::push_image(
                 sprites,
@@ -227,7 +202,7 @@ impl CreditsScreen {
             );
         }
         self.back
-            .draw(frame, &kit.button, (BUTTON_TEXT_SIZE * scale).round());
+            .draw(frame, kit, (FLAT_BUTTON_TEXT_SIZE * scale).round());
     }
 }
 
@@ -238,6 +213,7 @@ mod tests {
     #[test]
     fn title_and_headings_are_translated() {
         assert!(crate::game::locale::is_translated(TITLE));
+        assert!(crate::game::locale::is_translated(BACK_TEXT));
         for (heading, _) in CREDITS {
             assert!(crate::game::locale::is_translated(heading), "{heading}");
         }
@@ -251,6 +227,7 @@ mod tests {
             .sum();
         let gaps = SECTION_GAP * (CREDITS.len() - 1) as f32;
         let bottom = SECTIONS_TOP + lines + gaps + BOTTOM_DIVIDER[0] + BOTTOM_DIVIDER[2];
-        assert!(bottom < BACK_BUTTON[1], "credits end at {bottom}");
+        let back_top = BACK_BUTTON[1] - FLAT_BUTTON_SIZE[1] / 2.0;
+        assert!(bottom < back_top, "credits end at {bottom}");
     }
 }

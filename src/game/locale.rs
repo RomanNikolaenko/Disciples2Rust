@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use super::settings::OptionValue;
 
+/// The interface font (Inter, SIL Open Font License, `assets/fonts/Inter-LICENSE.txt`),
+/// relative to the assets directory: regular and bold. It must cover every language's
+/// text (tested below).
+pub const UI_FONTS: [&str; 2] = ["fonts/Inter-Regular.ttf", "fonts/Inter-Bold.ttf"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Language {
     #[default]
@@ -33,6 +38,38 @@ impl Language {
         match self {
             Self::English => english,
             Self::Ukrainian => ukrainian(english).unwrap_or(english),
+        }
+    }
+
+    /// Update button: an installable newer version.
+    pub fn update_to(self, version: &str) -> String {
+        match self {
+            Self::English => format!("Update to {version}"),
+            Self::Ukrainian => format!("Оновити до {version}"),
+        }
+    }
+
+    /// Update button: a newer version this build cannot install (development run).
+    pub fn update_available(self, version: &str) -> String {
+        match self {
+            Self::English => format!("{version} available"),
+            Self::Ukrainian => format!("Доступна {version}"),
+        }
+    }
+
+    /// Update button while downloading.
+    pub fn downloading(self, percent: u32) -> String {
+        match self {
+            Self::English => format!("Downloading {percent}%"),
+            Self::Ukrainian => format!("Завантаження {percent}%"),
+        }
+    }
+
+    /// The update confirmation's message.
+    pub fn update_message(self, version: &str) -> String {
+        match self {
+            Self::English => format!("{version} will be downloaded and the game will restart."),
+            Self::Ukrainian => format!("{version} буде завантажено, і гра перезапуститься."),
         }
     }
 
@@ -93,6 +130,14 @@ fn ukrainian(english: &str) -> Option<&'static str> {
         "Apply settings?" => "Застосувати налаштування?",
         "The new settings will be saved." => "Нові налаштування буде збережено.",
         "Exit the game?" => "Вийти з гри?",
+        // Updates.
+        "Checking…" => "Перевірка…",
+        "Up to date" => "Актуальна версія",
+        "Updates" => "Оновлення",
+        "Restarting…" => "Перезапуск…",
+        "Retry update" => "Повторити",
+        "Install the update?" => "Встановити оновлення?",
+        "Update" => "Оновити",
         "Restore defaults?" => "Відновити типові налаштування?",
         "Restore" => "Відновити",
         "Settings on this tab will return to their default values." => {
@@ -190,6 +235,57 @@ mod tests {
             .chain([BackgroundFrameRateLimit::Unlimited.label()]);
         for value in values {
             assert!(is_translated(value), "{value}");
+        }
+    }
+
+    /// Every character the interface can show (all menu texts, translations and the
+    /// Ukrainian alphabet) has a glyph in both bundled font files.
+    #[test]
+    fn the_interface_font_covers_every_text() {
+        use glyphon::{FontSystem, fontdb};
+        use std::path::PathBuf;
+
+        let assets = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
+        let paths: Vec<PathBuf> = UI_FONTS.iter().map(|font| assets.join(font)).collect();
+        let mut db = fontdb::Database::new();
+        let families = crate::engine::render::ui_renderer::load_bundled_fonts(&mut db, &paths);
+        assert_eq!(families, ["Inter"]);
+        let faces: Vec<(fontdb::ID, fontdb::Weight)> =
+            db.faces().map(|face| (face.id, face.weight)).collect();
+        assert_eq!(faces.len(), UI_FONTS.len(), "one face per file");
+
+        let sources = [
+            include_str!("locale.rs"),
+            include_str!("menus/main_menu.rs"),
+            include_str!("menus/settings_screen.rs"),
+            include_str!("menus/credits_screen.rs"),
+            include_str!("settings/mod.rs"),
+            include_str!("settings/graphics.rs"),
+            include_str!("settings/display.rs"),
+            "АБВГҐДЕЄЖЗИІЇЙКЛМНОПРСТУФХЦЧШЩЬЮЯабвгґдеєжзиіїйклмнопрстуфхцчшщьюяʼ’«»№",
+        ];
+        let mut needed: Vec<char> = sources
+            .iter()
+            .flat_map(|text| text.chars())
+            .filter(|c| !c.is_control() && !c.is_whitespace())
+            .collect();
+        needed.sort_unstable();
+        needed.dedup();
+
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        for (id, weight) in faces {
+            let font = fonts.get_font(id, weight).expect("bundled face loads");
+            let charmap = font.as_swash().charmap();
+            assert_eq!(
+                charmap.map('\u{4E2D}'),
+                0,
+                "the check can tell a missing glyph"
+            );
+            let missing: String = needed.iter().filter(|&&c| charmap.map(c) == 0).collect();
+            assert!(
+                missing.is_empty(),
+                "{weight:?} lacks glyphs for {missing:?}"
+            );
         }
     }
 }
