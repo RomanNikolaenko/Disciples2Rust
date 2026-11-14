@@ -28,8 +28,8 @@ use super::credits_screen::CreditsScreen;
 use super::screen_flow::{FlowEvent, ScreenFlow, Transition};
 use super::settings_screen::{SettingsEvent, SettingsScreen, WHEEL_LINE};
 use super::widgets::{
-    self, DIALOG_CANCEL, DIALOG_CONFIRM, Dialog, FLAT_BUTTON_SIZE, FLAT_BUTTON_TEXT_SIZE, FULL_UV,
-    FlatButton, StoneButton, UiKit, palette, scaled,
+    self, DIALOG_CANCEL, DIALOG_CONFIRM, Dialog, FULL_UV, FlatButton, STONE_BUTTON_GAP,
+    STONE_BUTTON_SIZE, StoneButton, UiKit, palette, scaled,
 };
 use crate::engine::render::GpuContext;
 use crate::engine::render::ui_renderer::{SpriteMaterial, TextureSetId, UiFrame, UiRenderer};
@@ -44,21 +44,15 @@ const REFERENCE_SIZE: [f32; 2] = [1920.0, 1080.0];
 const MENU_LEFT: f32 = 110.0;
 /// Top of the main column, so that the column is centered vertically.
 const MENU_TOP: f32 = (REFERENCE_SIZE[1] - column_height()) / 2.0;
-/// Lower than the art's natural aspect (1410x342 → 264x64): the 9-slice keeps the end
-/// ornaments' proportions (they scale with the height) and stretches only the stone.
-const BUTTON_SIZE: [f32; 2] = [336.0, 64.0];
-/// Button height plus a 10 px gap.
-const BUTTON_PITCH: f32 = 74.0;
+/// The main buttons have the stone button's default size and gap.
+const BUTTON_SIZE: [f32; 2] = STONE_BUTTON_SIZE;
+const BUTTON_PITCH: f32 = BUTTON_SIZE[1] + STONE_BUTTON_GAP;
 /// Extra space before buttons that start a new section (e.g. Exit).
 const SECTION_GAP: f32 = 28.0;
 const PANEL_WIDTH: f32 = 780.0;
-/// Update button (a plain one): width and height, reference pixels.
-const UPDATE_SIZE: [f32; 2] = FLAT_BUTTON_SIZE;
-/// Its gap to the screen's bottom edge and to its right edge (the same), reference
-/// pixels.
+/// The Update button's gap to the screen's bottom edge and to its right edge (the
+/// same), reference pixels.
 const UPDATE_MARGIN: f32 = 16.0;
-const UPDATE_TEXT_SIZE: f32 = FLAT_BUTTON_TEXT_SIZE;
-const LABEL_SIZE: f32 = 26.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -255,8 +249,11 @@ impl MainMenu {
         self.credits.layout(self.scale, self.viewport);
         self.exit_dialog
             .layout(self.scale, self.viewport, &self.kit);
-        self.update_button
-            .place(update_button_rect(self.scale, self.viewport));
+        self.update_button.place(update_button_rect(
+            self.update_button.size,
+            self.scale,
+            self.viewport,
+        ));
         self.update_dialog
             .layout(self.scale, self.viewport, &self.kit);
         self.refresh_hover();
@@ -661,16 +658,14 @@ impl MainMenu {
         );
 
         frame.group_opacity = self.flow.opacity();
-        let label_size = (LABEL_SIZE * self.scale).round();
         match self.flow.current() {
             Screen::Main => {
                 for button in &self.main_buttons {
-                    button.draw(frame, &self.kit.button, label_size);
+                    button.draw(frame, &self.kit.button, self.scale);
                 }
                 let (text, _) = update_button_text(&self.update_state, language);
                 self.update_button.set_text(renderer, &text);
-                let update_size = (UPDATE_TEXT_SIZE * self.scale).round();
-                self.update_button.draw(frame, &self.kit, update_size);
+                self.update_button.draw(frame, &self.kit, self.scale);
                 if self.exit_dialog_open {
                     self.exit_dialog.draw(frame, &self.kit);
                 }
@@ -812,13 +807,13 @@ fn ui_scale(viewport: [f32; 2]) -> f32 {
     (viewport[0] / REFERENCE_SIZE[0]).min(viewport[1] / REFERENCE_SIZE[1])
 }
 
-/// The update button: in the screen's bottom-right corner with the same gap below and
-/// to the right. Anchored to the viewport rather than the 1920x1080 reference, which
-/// stops short of the corner on screens wider or taller than 16:9. Whole pixels (the
-/// viewport is in whole physical pixels).
-fn update_button_rect(scale: f32, viewport: [f32; 2]) -> Rect {
+/// The update button (of `size` reference pixels): in the screen's bottom-right corner
+/// with the same gap below and to the right. Anchored to the viewport rather than the
+/// 1920x1080 reference, which stops short of the corner on screens wider or taller than
+/// 16:9. Whole pixels (the viewport is in whole physical pixels).
+fn update_button_rect(size: [f32; 2], scale: f32, viewport: [f32; 2]) -> Rect {
     let margin = (UPDATE_MARGIN * scale).round();
-    let [w, h] = UPDATE_SIZE.map(|side| (side * scale).round());
+    let [w, h] = size.map(|side| (side * scale).round());
     Rect::new(viewport[0] - margin - w, viewport[1] - margin - h, w, h)
 }
 
@@ -854,6 +849,7 @@ fn layout_column(section_starts: impl Iterator<Item = bool>, scale: f32) -> Vec<
 
 #[cfg(test)]
 mod tests {
+    use super::super::widgets::FLAT_BUTTON_SIZE;
     use super::*;
 
     #[test]
@@ -869,7 +865,7 @@ mod tests {
     fn column_applies_pitch_and_section_gap() {
         let rects = layout_column(MAIN_BUTTONS.iter().map(|spec| spec.starts_section), 1.0);
         let ys: Vec<f32> = rects.iter().map(|r| r.y).collect();
-        assert_eq!(ys, [346.0, 420.0, 494.0, 568.0, 670.0]);
+        assert_eq!(ys, [330.0, 412.0, 494.0, 576.0, 686.0]);
         assert!(
             rects
                 .iter()
@@ -884,7 +880,7 @@ mod tests {
     #[test]
     fn column_scales() {
         let rects = layout_column([false].into_iter(), 0.5);
-        assert_eq!(rects[0], Rect::new(55.0, 173.0, 168.0, 32.0));
+        assert_eq!(rects[0], Rect::new(55.0, 165.0, 168.0, 32.0));
     }
 
     #[test]
@@ -946,7 +942,7 @@ mod tests {
     #[test]
     fn update_button_sits_in_the_bottom_right_corner() {
         assert_eq!(
-            update_button_rect(1.0, REFERENCE_SIZE),
+            update_button_rect(FLAT_BUTTON_SIZE, 1.0, REFERENCE_SIZE),
             Rect::new(1684.0, 1026.0, 220.0, 38.0)
         );
         for viewport in [
@@ -957,7 +953,7 @@ mod tests {
             [3840.0, 2160.0],
         ] {
             let scale = ui_scale(viewport);
-            let rect = update_button_rect(scale, viewport);
+            let rect = update_button_rect(FLAT_BUTTON_SIZE, scale, viewport);
             let right_gap = viewport[0] - (rect.x + rect.w);
             let bottom_gap = viewport[1] - (rect.y + rect.h);
             assert_eq!(

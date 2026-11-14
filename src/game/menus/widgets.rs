@@ -293,12 +293,18 @@ pub struct FlatButton {
     label: LabelId,
     rect: Rect,
     pub enabled: bool,
+    /// Size and label size in reference pixels (1920x1080), scaled with the UI; start
+    /// as [`FLAT_BUTTON_SIZE`] / [`FLAT_BUTTON_TEXT_SIZE`]. Screens lay the button out
+    /// with `size`; change them for a button that needs its own.
+    pub size: [f32; 2],
+    pub text_size: f32,
     hover: Tween,
     press: Tween,
 }
 
-/// Size of a [`FlatButton`] (reference pixels) and its label size: the main menu's
-/// Update button and the Credits screen's Back button.
+/// Default size of a [`FlatButton`] (reference pixels) and of its label, as on the main
+/// menu's Update button and the Credits screen's Back button. A button can be given its
+/// own through its `size` / `text_size` fields.
 pub const FLAT_BUTTON_SIZE: [f32; 2] = [220.0, 38.0];
 pub const FLAT_BUTTON_TEXT_SIZE: f32 = 17.0;
 /// sRGB border of a disabled [`FlatButton`] (enabled: [`palette::ROW_LINE`], warming
@@ -319,11 +325,14 @@ impl FlatButton {
             label: renderer.create_label("", TextStyle::CENTERED),
             rect: Rect::new(0.0, 0.0, 0.0, 0.0),
             enabled: false,
+            size: FLAT_BUTTON_SIZE,
+            text_size: FLAT_BUTTON_TEXT_SIZE,
             hover: Tween::new(0.0),
             press: Tween::new(0.0),
         }
     }
 
+    /// `rect` in physical pixels, normally `size` scaled.
     pub fn place(&mut self, rect: Rect) {
         self.rect = rect;
     }
@@ -365,8 +374,10 @@ impl FlatButton {
         self.press.set(0.0);
     }
 
-    pub fn draw(&self, frame: &mut UiFrame, kit: &UiKit, font_size: f32) {
+    /// `scale`: the UI scale (physical pixels per reference pixel), for the label size.
+    pub fn draw(&self, frame: &mut UiFrame, kit: &UiKit, scale: f32) {
         let rect = self.rect;
+        let font_size = (self.text_size * scale).round();
         // Border in whole pixels, scaling with the button.
         let border = (rect.h / 26.0).round().max(1.0);
         let hover = self.hover.value() * (1.0 - 0.5 * self.press.value());
@@ -449,12 +460,26 @@ fn mix_srgb(a: [u8; 4], b: [u8; 4], t: f32) -> [u8; 4] {
     })
 }
 
+/// Default size of a [`StoneButton`] (reference pixels, 1920x1080), of its label, and
+/// the gap between stacked buttons: the main menu's buttons. Every screen uses these;
+/// a button can be given its own through its `size` / `text_size` fields. Lower than the art's natural aspect (1410x342 →
+/// 264x64): the 9-slice keeps the end ornaments' proportions (they scale with the
+/// height) and stretches only the stone.
+pub const STONE_BUTTON_SIZE: [f32; 2] = [336.0, 64.0];
+pub const STONE_BUTTON_TEXT_SIZE: f32 = 26.0;
+pub const STONE_BUTTON_GAP: f32 = 18.0;
+
 /// The textured stone button with a crystal glow on hover.
 pub struct StoneButton {
     label: LabelId,
     /// English text: the translation key for [`Self::relabel`].
     text: &'static str,
     layout: NineSliceLayout,
+    /// Size and label size in reference pixels (1920x1080), scaled with the UI; start
+    /// as [`STONE_BUTTON_SIZE`] / [`STONE_BUTTON_TEXT_SIZE`]. Screens lay the button out
+    /// with `size`; change them for a button that needs its own.
+    pub size: [f32; 2],
+    pub text_size: f32,
     pub enabled: bool,
     /// Current tab: drawn darkened with unlit crystals, not clickable.
     pub selected: bool,
@@ -470,6 +495,8 @@ impl StoneButton {
             label: renderer.create_label(text, TextStyle::CENTERED),
             text,
             layout: NineSliceLayout::new(Rect::new(0.0, 0.0, 0.0, 0.0), [1.0, 1.0], BUTTON_BORDERS),
+            size: STONE_BUTTON_SIZE,
+            text_size: STONE_BUTTON_TEXT_SIZE,
             enabled,
             selected: false,
             dark: false,
@@ -478,6 +505,7 @@ impl StoneButton {
         }
     }
 
+    /// `rect` in physical pixels, normally `size` scaled.
     pub fn place(&mut self, rect: Rect, art: &ButtonArt) {
         self.layout = NineSliceLayout::new(rect, art.size, BUTTON_BORDERS);
     }
@@ -521,12 +549,13 @@ impl StoneButton {
         self.press.set(0.0);
     }
 
-    pub fn draw(&self, frame: &mut UiFrame, art: &ButtonArt, font_size: f32) {
+    /// `scale`: the UI scale (physical pixels per reference pixel), for the label size.
+    pub fn draw(&self, frame: &mut UiFrame, art: &ButtonArt, scale: f32) {
         self.draw_to(
             &mut frame.group_sprites,
             &mut frame.group_labels,
             art,
-            font_size,
+            scale,
             1.0,
         );
     }
@@ -537,9 +566,10 @@ impl StoneButton {
         sprites: &mut Vec<Sprite>,
         labels: &mut Vec<LabelDraw>,
         art: &ButtonArt,
-        font_size: f32,
+        scale: f32,
         opacity: f32,
     ) {
+        let font_size = (self.text_size * scale).round();
         let tint = if self.selected {
             SELECTED_TINT
         } else if self.dark {
@@ -909,8 +939,10 @@ pub fn segment_rects(area: Rect, count: usize, gap: f32) -> impl Iterator<Item =
 pub const DIALOG_CONFIRM: usize = 0;
 pub const DIALOG_CANCEL: usize = 1;
 
-const DIALOG_PANEL: [f32; 4] = [580.0, 380.0, 760.0, 320.0];
-const DIALOG_BUTTON: [f32; 2] = [300.0, 68.0];
+/// Wide enough for two default-size stone buttons and the gap between them.
+const DIALOG_PANEL: [f32; 4] = [560.0, 380.0, 800.0, 320.0];
+const DIALOG_BUTTON_GAP: f32 = 40.0;
+const _: () = assert!(2.0 * STONE_BUTTON_SIZE[0] + DIALOG_BUTTON_GAP < DIALOG_PANEL[2]);
 const DIALOG_FADE: f32 = 0.15;
 /// Backdrop that dims everything behind a dialog.
 const DIALOG_BACKDROP: [u8; 4] = [0, 0, 0, 150];
@@ -969,12 +1001,11 @@ impl Dialog {
         self.title_rect = at(x, y + 34.0, w, 48.0);
         self.divider = at(x + w / 2.0 - 150.0, y + 88.0, 300.0, 22.0);
         self.message_rect = at(x, y + 122.0, w, 40.0);
-        let [bw, bh] = DIALOG_BUTTON;
-        let gap = 40.0;
-        let left = x + (w - 2.0 * bw - gap) / 2.0;
-        for (index, button) in self.buttons.iter_mut().enumerate() {
-            let bx = left + index as f32 * (bw + gap);
+        let sizes = self.buttons.each_ref().map(|button| button.size);
+        let mut bx = x + (w - sizes[0][0] - sizes[1][0] - DIALOG_BUTTON_GAP) / 2.0;
+        for (button, [bw, bh]) in self.buttons.iter_mut().zip(sizes) {
             button.place(at(bx, y + h - bh - 36.0, bw, bh), &kit.button);
+            bx += bw + DIALOG_BUTTON_GAP;
         }
     }
 
@@ -1090,7 +1121,7 @@ impl Dialog {
                 &mut frame.overlay_sprites,
                 &mut frame.overlay_labels,
                 &kit.button,
-                (24.0 * scale).round(),
+                scale,
                 opacity,
             );
         }

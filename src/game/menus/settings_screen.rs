@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 
 use super::widgets::{
     self, ARROW_LEFT, ARROW_RIGHT, DIALOG_CANCEL, DIALOG_CONFIRM, Dialog, FULL_UV, OptionSelector,
-    SelectorState, Slider, StoneButton, UiKit, palette, scaled,
+    STONE_BUTTON_GAP, STONE_BUTTON_SIZE, SelectorState, Slider, StoneButton, UiKit, palette,
+    scaled,
 };
 use crate::engine::animation::{Easing, Tween};
 use crate::engine::render::ui_renderer::{
@@ -53,8 +54,6 @@ use crate::game::settings::{
 // Reference layout (1920x1080).
 const LEFT: f32 = 230.0;
 const TOP: f32 = 130.0;
-const BUTTON_SIZE: [f32; 2] = [336.0, 72.0];
-const TAB_PITCH: f32 = 88.0;
 const PANEL_LEFT: f32 = 610.0;
 const HEADER: [f32; 4] = [PANEL_LEFT, 118.0, 760.0, 48.0];
 const BRUSH: [f32; 4] = [PANEL_LEFT - 6.0, 166.0, 520.0, 14.0];
@@ -89,9 +88,10 @@ const SCROLLBAR: [f32; 2] = [1746.0, 8.0]; // x, width
 /// Extra grab area on each side of the thin scrollbar.
 const SCROLLBAR_GRAB: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 48.0;
-const BOTTOM_Y: f32 = 950.0;
+/// Vertical center of the bottom buttons (Back, Reset, Apply, Default) and their left
+/// edges. Tabs and buttons have the stone button's own size and gap.
+const BOTTOM_CENTER: f32 = 986.0;
 const BOTTOM_X: [f32; 4] = [LEFT, PANEL_LEFT, 982.0, 1354.0];
-const BUTTON_TEXT_SIZE: f32 = 24.0;
 const HEADER_TEXT_SIZE: f32 = 30.0;
 const ROW_TEXT_SIZE: f32 = 22.0;
 const HEADING_TEXT_SIZE: f32 = 20.0;
@@ -137,7 +137,12 @@ const _: () = assert!(PART_ARROW + ARROW_RIGHT < ROW_PARTS);
 
 // Layout invariants, checked at compile time.
 const _: () = assert!(SELECTOR[0] + SELECTOR[1] < SCROLLBAR[0] - SCROLLBAR_GRAB);
-const _: () = assert!(LIST_BOTTOM < BOTTOM_Y);
+const _: () = assert!(LIST_BOTTOM < BOTTOM_CENTER - STONE_BUTTON_SIZE[1] / 2.0);
+// The bottom buttons, at their default width, neither overlap nor leave the screen.
+const _: () = assert!(BOTTOM_X[1] - BOTTOM_X[0] > STONE_BUTTON_SIZE[0]);
+const _: () = assert!(BOTTOM_X[2] - BOTTOM_X[1] > STONE_BUTTON_SIZE[0]);
+const _: () = assert!(BOTTOM_X[3] - BOTTOM_X[2] > STONE_BUTTON_SIZE[0]);
+const _: () = assert!(BOTTOM_X[3] + STONE_BUTTON_SIZE[0] < 1920.0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -1261,13 +1266,16 @@ impl SettingsScreen {
 
     pub fn layout(&mut self, scale: f32, viewport: [f32; 2], kit: &UiKit) {
         self.scale = scale;
-        let [w, h] = BUTTON_SIZE;
-        for (index, tab) in self.tabs.iter_mut().enumerate() {
-            let y = TOP + TAB_PITCH * index as f32;
+        let mut y = TOP;
+        for tab in &mut self.tabs {
+            let [w, h] = tab.size;
             tab.place(scaled(scale, LEFT, y, w, h), &kit.button);
+            y += h + STONE_BUTTON_GAP;
         }
         for (button, x) in self.bottom.iter_mut().zip(BOTTOM_X) {
-            button.place(scaled(scale, x, BOTTOM_Y, w, h), &kit.button);
+            let [w, h] = button.size;
+            let y = BOTTOM_CENTER - h / 2.0;
+            button.place(scaled(scale, x, y, w, h), &kit.button);
         }
         let [x, y, w, h] = HEADER;
         self.header_rect = scaled(scale, x, y, w, h);
@@ -1567,12 +1575,11 @@ impl SettingsScreen {
 
     pub fn build(&mut self, frame: &mut UiFrame, renderer: &mut UiRenderer, kit: &UiKit) {
         let scale = self.scale;
-        let button_text = (BUTTON_TEXT_SIZE * scale).round();
         for tab in &self.tabs {
-            tab.draw(frame, &kit.button, button_text);
+            tab.draw(frame, &kit.button, scale);
         }
         for button in &self.bottom {
-            button.draw(frame, &kit.button, button_text);
+            button.draw(frame, &kit.button, scale);
         }
         widgets::push_label(
             frame,

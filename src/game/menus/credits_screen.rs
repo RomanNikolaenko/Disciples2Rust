@@ -2,10 +2,7 @@
 //! like the main menu's Update button (the mockup shows no way back; the button sits
 //! where Settings has its own).
 
-use super::widgets::{
-    self, FLAT_BUTTON_SIZE, FLAT_BUTTON_TEXT_SIZE, FULL_UV, FlatButton, UiKit, canvas_origin,
-    canvas_scaled, palette,
-};
+use super::widgets::{self, FULL_UV, FlatButton, UiKit, canvas_origin, canvas_scaled, palette};
 use crate::engine::render::ui_renderer::{
     LabelId, SpriteMaterial, TextAlign, TextStyle, UiFrame, UiRenderer,
 };
@@ -142,7 +139,7 @@ impl CreditsScreen {
         self.bottom_divider = at(CENTER_X - w / 2.0, y + gap, w, h);
 
         let [x, center_y] = BACK_BUTTON;
-        let [w, h] = FLAT_BUTTON_SIZE;
+        let [w, h] = self.back.size;
         self.back.place(at(x, center_y - h / 2.0, w, h));
     }
 
@@ -201,13 +198,13 @@ impl CreditsScreen {
                 false,
             );
         }
-        self.back
-            .draw(frame, kit, (FLAT_BUTTON_TEXT_SIZE * scale).round());
+        self.back.draw(frame, kit, scale);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::widgets::FLAT_BUTTON_SIZE;
     use super::*;
 
     #[test]
