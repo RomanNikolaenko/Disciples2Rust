@@ -71,6 +71,7 @@ impl GpuContext {
     pub async fn new(
         window: Arc<Window>,
         display: OwnedDisplayHandle,
+        vsync: bool,
     ) -> Result<Self, RenderInitError> {
         // `_from_env` lets `WGPU_BACKEND`, `WGPU_DEBUG`, etc. override defaults when debugging.
         let instance = wgpu::Instance::new(
@@ -143,8 +144,7 @@ impl GpuContext {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
-            // Vsync without tearing; falls back to plain FIFO, which is always supported.
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: present_mode(vsync),
             desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: Vec::new(),
@@ -196,6 +196,19 @@ impl GpuContext {
     }
 
     /// Format of the presentation surface (sRGB when available, see module docs).
+    /// Switches between vsync and uncapped presentation; takes effect on the next frame.
+    pub fn set_vsync(&mut self, vsync: bool) {
+        let mode = present_mode(vsync);
+        if self.config.present_mode == mode {
+            return;
+        }
+        self.config.present_mode = mode;
+        if self.surface_configured {
+            self.configure_surface();
+        }
+        tracing::info!(vsync, "present mode changed");
+    }
+
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
     }
@@ -286,6 +299,16 @@ impl GpuContext {
                 self.surface_configured = false;
             }
         }
+    }
+}
+
+/// `AutoVsync` (no tearing) falls back to FIFO and `AutoNoVsync` to FIFO as well when the
+/// platform has no uncapped mode, so both are always valid.
+fn present_mode(vsync: bool) -> wgpu::PresentMode {
+    if vsync {
+        wgpu::PresentMode::AutoVsync
+    } else {
+        wgpu::PresentMode::AutoNoVsync
     }
 }
 

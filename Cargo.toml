@@ -9,7 +9,9 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 glyphon = "0.12.0"
 image = { version = "0.25.10", default-features = false, features = ["webp"] }
 pollster = "1.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
+toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # The wgpu major version must match glyphon 0.12 (GPU text rendering), which depends
@@ -17,6 +19,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 wgpu = "30.0.2"
 # Latest stable winit; 0.31 is still in beta.
 winit = "0.30.13"
+
+[dev-dependencies]
+# WGSL validation in tests; same version wgpu already uses, so nothing extra is built.
+naga = { version = "30.0.2", features = ["wgsl-in"] }
 
 # wgpu/naga are very slow without optimizations. Optimize dependencies in dev builds so
 # debug runs stay interactive; our own crate keeps opt-level 0 for fast rebuilds.

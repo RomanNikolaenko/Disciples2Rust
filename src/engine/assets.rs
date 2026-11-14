@@ -75,14 +75,25 @@ pub fn load_rgba(path: &Path) -> Result<RgbaImage, AssetError> {
     })
 }
 
-/// Loads a grayscale mask (white = full effect). Color inputs are reduced to luma.
+/// Loads a mask (white = full effect). Color is reduced to luma and multiplied by alpha,
+/// so "white on opaque black" and "white with an alpha falloff" mean the same thing.
 pub fn load_mask(path: &Path) -> Result<MaskImage, AssetError> {
-    let image = decode(path)?.into_luma8();
+    let image = decode(path)?.into_luma_alpha8();
+    let (width, height) = image.dimensions();
     Ok(MaskImage {
-        width: image.width(),
-        height: image.height(),
-        pixels: image.into_raw(),
+        width,
+        height,
+        pixels: luma_alpha_to_mask(&image.into_raw()),
     })
+}
+
+fn luma_alpha_to_mask(luma_alpha: &[u8]) -> Vec<u8> {
+    luma_alpha
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[luma, alpha]| ((u16::from(luma) * u16::from(alpha) + 127) / 255) as u8)
+        .collect()
 }
 
 fn decode(path: &Path) -> Result<image::DynamicImage, AssetError> {
@@ -159,6 +170,13 @@ mod tests {
             let back = linear_to_srgb(srgb_to_linear(value));
             assert!((back - value).abs() < 1e-5, "{value} -> {back}");
         }
+    }
+
+    #[test]
+    fn mask_strength_is_luma_times_alpha() {
+        // Opaque white, opaque black, white at half alpha, transparent white.
+        let mask = luma_alpha_to_mask(&[255, 255, 0, 255, 255, 128, 255, 0]);
+        assert_eq!(mask, [255, 0, 128, 0]);
     }
 
     #[test]

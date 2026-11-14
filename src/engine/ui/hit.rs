@@ -1,10 +1,10 @@
-//! Pointer hit testing against CPU-side alpha masks.
+//! Pointer hit testing: rectangles and CPU-side alpha masks.
 //!
 //! Transparent pixels of a widget must not take hover or clicks from whatever is behind
-//! it, so hit testing samples the widget's shape mask (never the GPU) and falls through
-//! to lower widgets when the sampled alpha is below the threshold.
+//! it, so alpha hit testing samples the widget's shape mask (never the GPU) and falls
+//! through to lower widgets when the sampled alpha is below the threshold.
 
-use super::geometry::NineSliceLayout;
+use super::geometry::{NineSliceLayout, Rect};
 
 /// Default alpha (0–255) at or above which a pixel counts as part of the shape.
 pub const DEFAULT_ALPHA_THRESHOLD: u8 = 128;
@@ -47,11 +47,41 @@ impl AlphaMask {
     }
 }
 
-/// One hit-testable widget, listed in draw order (later entries are on top).
+/// The interactive region of a widget.
+#[derive(Debug, Clone, Copy)]
+pub enum HitShape<'a> {
+    /// The whole rectangle (e.g. a slider track with padding).
+    Rectangle(Rect),
+    /// Only texels whose alpha reaches `threshold`, mapped through the 9-slice layout the
+    /// widget is drawn with. `mask` is the shape mask, not the glow mask.
+    Alpha {
+        layout: &'a NineSliceLayout,
+        mask: &'a AlphaMask,
+        threshold: u8,
+    },
+}
+
+impl HitShape<'_> {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        match *self {
+            Self::Rectangle(rect) => rect.contains(x, y),
+            Self::Alpha {
+                layout,
+                mask,
+                threshold,
+            } => layout
+                .texel_at(x, y)
+                .is_some_and(|[u, v]| mask.alpha_at(u, v) >= threshold),
+        }
+    }
+}
+
+/// One hit-testable widget. Targets are passed in draw order (later entries are on top).
 #[derive(Debug, Clone, Copy)]
 pub struct HitTarget<'a> {
-    pub layout: &'a NineSliceLayout,
-    pub mask: &'a AlphaMask,
+    /// Caller-defined widget id, returned in [`Hit`].
+    pub id: usize,
+    pub shape: HitShape<'a>,
     /// Disabled or otherwise non-interactive widgets still block the pointer.
     pub interactive: bool,
 }
@@ -67,24 +97,30 @@ pub enum Hit {
     Interactive(usize),
 }
 
-/// Finds the topmost widget whose shape covers `(x, y)`. `targets` are in draw order;
-/// the returned index refers to that order.
-pub fn topmost_hit<'a, I>(targets: I, x: f32, y: f32, threshold: u8) -> Hit
+impl Hit {
+    /// The interactive widget under the pointer, if any.
+    pub fn interactive(self) -> Option<usize> {
+        match self {
+            Self::Interactive(id) => Some(id),
+            Self::Blocked(_) | Self::Nothing => None,
+        }
+    }
+}
+
+/// Finds the topmost widget whose shape covers `(x, y)`.
+pub fn topmost_hit<'a, I>(targets: I, x: f32, y: f32) -> Hit
 where
     I: IntoIterator<Item = HitTarget<'a>>,
-    I::IntoIter: DoubleEndedIterator + ExactSizeIterator,
+    I::IntoIter: DoubleEndedIterator,
 {
-    for (index, target) in targets.into_iter().enumerate().rev() {
-        let Some([u, v]) = target.layout.texel_at(x, y) else {
-            continue;
-        };
-        if target.mask.alpha_at(u, v) < threshold {
-            continue; // Transparent pixel: fall through to widgets behind.
+    for target in targets.into_iter().rev() {
+        if !target.shape.contains(x, y) {
+            continue; // Outside, or a transparent pixel: fall through to widgets behind.
         }
         return if target.interactive {
-            Hit::Interactive(index)
+            Hit::Interactive(target.id)
         } else {
-            Hit::Blocked(index)
+            Hit::Blocked(target.id)
         };
     }
     Hit::Nothing
@@ -93,7 +129,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ui::geometry::{NineSlice, Rect};
+    use crate::engine::ui::geometry::NineSlice;
 
     const NO_BORDERS: NineSlice = NineSlice {
         left: 0.0,
@@ -118,6 +154,23 @@ mod tests {
         NineSliceLayout::new(Rect::new(x, 0.0, 40.0, 20.0), [4.0, 2.0], NO_BORDERS)
     }
 
+    fn alpha_target<'a>(
+        id: usize,
+        layout: &'a NineSliceLayout,
+        mask: &'a AlphaMask,
+        interactive: bool,
+    ) -> HitTarget<'a> {
+        HitTarget {
+            id,
+            shape: HitShape::Alpha {
+                layout,
+                mask,
+                threshold: DEFAULT_ALPHA_THRESHOLD,
+            },
+            interactive,
+        }
+    }
+
     #[test]
     fn samples_and_clamps_alpha() {
         let mask = mask();
@@ -133,23 +186,15 @@ mod tests {
         let back = layout(0.0);
         let front = layout(20.0); // Overlaps `back` on x in 20..40.
         let targets = [
-            HitTarget {
-                layout: &back,
-                mask: &mask,
-                interactive: true,
-            },
-            HitTarget {
-                layout: &front,
-                mask: &mask,
-                interactive: true,
-            },
+            alpha_target(7, &back, &mask, true),
+            alpha_target(9, &front, &mask, true),
         ];
         // x = 25 is the transparent left column of `front`: the click goes to `back`.
-        assert_eq!(topmost_hit(targets, 25.0, 5.0, 128), Hit::Interactive(0));
+        assert_eq!(topmost_hit(targets, 25.0, 5.0), Hit::Interactive(7));
         // x = 35 is opaque in `front`, which is on top.
-        assert_eq!(topmost_hit(targets, 35.0, 5.0, 128), Hit::Interactive(1));
+        assert_eq!(topmost_hit(targets, 35.0, 5.0), Hit::Interactive(9));
         // x = 5 is the transparent column of `back`, nothing else there.
-        assert_eq!(topmost_hit(targets, 5.0, 5.0, 128), Hit::Nothing);
+        assert_eq!(topmost_hit(targets, 5.0, 5.0), Hit::Nothing);
     }
 
     #[test]
@@ -158,17 +203,48 @@ mod tests {
         let back = layout(0.0);
         let front = layout(20.0);
         let targets = [
+            alpha_target(0, &back, &mask, true),
+            alpha_target(1, &front, &mask, false),
+        ];
+        assert_eq!(topmost_hit(targets, 35.0, 5.0), Hit::Blocked(1));
+        assert_eq!(topmost_hit(targets, 35.0, 5.0).interactive(), None);
+    }
+
+    #[test]
+    fn rectangle_shape_ignores_alpha() {
+        let mask = mask();
+        let back = layout(0.0);
+        let targets = [
+            alpha_target(0, &back, &mask, true),
             HitTarget {
-                layout: &back,
-                mask: &mask,
+                id: 5,
+                shape: HitShape::Rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)),
                 interactive: true,
             },
-            HitTarget {
-                layout: &front,
-                mask: &mask,
-                interactive: false,
-            },
         ];
-        assert_eq!(topmost_hit(targets, 35.0, 5.0, 128), Hit::Blocked(1));
+        // Transparent texel of `back`, but inside the rectangle on top.
+        assert_eq!(topmost_hit(targets, 5.0, 5.0), Hit::Interactive(5));
+        assert_eq!(topmost_hit(targets, 15.0, 5.0), Hit::Interactive(0));
+    }
+
+    #[test]
+    fn threshold_is_per_target() {
+        let mut rgba = Vec::new();
+        for alpha in [100u8, 200] {
+            rgba.extend_from_slice(&[0, 0, 0, alpha]);
+        }
+        let mask = AlphaMask::from_rgba(2, 1, &rgba);
+        let layout = NineSliceLayout::new(Rect::new(0.0, 0.0, 2.0, 1.0), [2.0, 1.0], NO_BORDERS);
+        let target = |threshold| HitTarget {
+            id: 0,
+            shape: HitShape::Alpha {
+                layout: &layout,
+                mask: &mask,
+                threshold,
+            },
+            interactive: true,
+        };
+        assert_eq!(topmost_hit([target(128)], 0.5, 0.5), Hit::Nothing);
+        assert_eq!(topmost_hit([target(64)], 0.5, 0.5), Hit::Interactive(0));
     }
 }

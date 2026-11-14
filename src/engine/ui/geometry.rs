@@ -22,6 +22,21 @@ impl Rect {
     pub fn contains(&self, px: f32, py: f32) -> bool {
         px >= self.x && py >= self.y && px < self.x + self.w && py < self.y + self.h
     }
+
+    /// The overlapping area; zero-sized (at the clamped corner) when they do not overlap.
+    pub fn intersect(&self, other: &Rect) -> Rect {
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = (self.x + self.w).min(other.x + other.w).max(left);
+        let bottom = (self.y + self.h).min(other.y + other.h).max(top);
+        Rect::new(left, top, right - left, bottom - top)
+    }
+
+    /// Whether the two rectangles share any area.
+    pub fn overlaps(&self, other: &Rect) -> bool {
+        let overlap = self.intersect(other);
+        overlap.w > 0.0 && overlap.h > 0.0
+    }
 }
 
 /// Fixed border widths of a 9-slice image, in source texels.
@@ -167,6 +182,21 @@ pub fn cover_uv(texture_size: [f32; 2], viewport_size: [f32; 2]) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intersection_clips_to_the_shared_area() {
+        let a = Rect::new(0.0, 0.0, 100.0, 50.0);
+        let b = Rect::new(60.0, 20.0, 100.0, 100.0);
+        assert_eq!(a.intersect(&b), Rect::new(60.0, 20.0, 40.0, 30.0));
+        assert!(a.overlaps(&b));
+        let apart = Rect::new(200.0, 0.0, 10.0, 10.0);
+        assert_eq!(a.intersect(&apart).w, 0.0);
+        assert!(!a.overlaps(&apart));
+        assert!(
+            !a.overlaps(&Rect::new(100.0, 0.0, 10.0, 10.0)),
+            "edges only touch"
+        );
+    }
 
     const BORDERS: NineSlice = NineSlice {
         left: 40.0,

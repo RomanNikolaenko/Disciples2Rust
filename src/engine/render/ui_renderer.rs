@@ -4,7 +4,8 @@
 //! Frame order:
 //! 1. Group pass (offscreen, cleared to transparent): group sprites, then group labels.
 //! 2. Surface pass: background sprites, then the group texture blended with the group
-//!    opacity.
+//!    opacity, then the overlay layer (sprites, then labels) on top of everything —
+//!    dialogs and the FPS counter, which must not fade or be covered by group text.
 //!
 //! Applying the opacity once, after the group's children are composed, keeps labels from
 //! double-blending over their buttons and lets masked children fade smoothly with their
@@ -12,6 +13,10 @@
 //! recreated when the surface size changes.
 //!
 //! Alpha convention: premultiplied everywhere (textures, offscreen target, output).
+//!
+//! Clipping: a run of group sprites and labels can be clipped to a rectangle (scrolling
+//! lists). Sprites carry the rectangle per vertex and the fragment shader zeroes what
+//! falls outside; labels use glyphon's text bounds.
 
 use std::ops::Range;
 
@@ -19,7 +24,7 @@ use bytemuck::{Pod, Zeroable};
 use glyphon::cosmic_text::Align;
 use glyphon::{
     Attrs, Buffer, Cache, Color, ColorMode, Family, FontSystem, Metrics, Resolution, Shaping,
-    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 
 use super::FrameTarget;
@@ -35,16 +40,16 @@ const SURFACE_CLEAR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 const LINE_HEIGHT_FACTOR: f32 = 1.25;
-/// Preferred serif families, first installed one wins. A bundled font will replace this.
-const SERIF_CANDIDATES: [&str; 8] = [
-    "Georgia",
-    "Cambria",
-    "Palatino Linotype",
-    "Book Antiqua",
-    "Times New Roman",
-    "DejaVu Serif",
-    "Liberation Serif",
-    "Noto Serif",
+/// Preferred sans-serif families, first installed one wins. A bundled font will replace
+/// this lookup.
+const SANS_CANDIDATES: [&str; 7] = [
+    "Roboto",
+    "Segoe UI",
+    "Noto Sans",
+    "Open Sans",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Arial",
 ];
 
 /// Handle to a base texture + glow mask pair registered with the renderer.
@@ -54,6 +59,35 @@ pub struct TextureSetId(usize);
 /// Handle to a text label owned by the renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LabelId(usize);
+
+impl LabelId {
+    /// A handle for layout tests that never reach the renderer.
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        Self(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// How a label is shaped; fixed per label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextStyle {
+    pub bold: bool,
+    pub align: TextAlign,
+}
+
+impl TextStyle {
+    pub const CENTERED: Self = Self {
+        bold: false,
+        align: TextAlign::Center,
+    };
+}
 
 /// Per-sprite material instance values (the material definition is the sprite shader).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -65,6 +99,12 @@ pub struct SpriteMaterial {
     /// Linear RGB.
     pub glow_color: [f32; 3],
     pub glow_intensity: f32,
+    /// Linear RGBA multiplier with straight alpha (applied before glow). White = unchanged;
+    /// used for flat-colored sprites and darkened states.
+    pub tint: [f32; 4],
+    /// Gamma adjustment in linear light: color^(1 / gamma). 1 = unchanged; above 1
+    /// brightens mid-tones. Used for the game image's calibration, not for the interface.
+    pub gamma: f32,
 }
 
 impl SpriteMaterial {
@@ -75,7 +115,31 @@ impl SpriteMaterial {
         opacity: 1.0,
         glow_color: [0.0; 3],
         glow_intensity: 0.0,
+        tint: [1.0; 4],
+        gamma: 1.0,
     };
+
+    /// A flat color (sRGB RGBA) for sprites drawn with a white texture.
+    pub fn tinted(srgb: [u8; 4]) -> Self {
+        Self {
+            tint: [
+                srgb_to_linear(srgb[0]),
+                srgb_to_linear(srgb[1]),
+                srgb_to_linear(srgb[2]),
+                f32::from(srgb[3]) / 255.0,
+            ],
+            ..Self::PLAIN
+        }
+    }
+}
+
+fn srgb_to_linear(value: u8) -> f32 {
+    let c = f32::from(value) / 255.0;
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,7 +159,8 @@ pub struct Sprite {
     pub material: SpriteMaterial,
 }
 
-/// A label drawn centered in `rect`.
+/// A label drawn in `rect`: aligned horizontally by its [`TextStyle`], centered
+/// vertically.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LabelDraw {
     pub label: LabelId,
@@ -113,6 +178,25 @@ pub struct UiFrame {
     pub group_sprites: Vec<Sprite>,
     pub group_labels: Vec<LabelDraw>,
     pub group_opacity: f32,
+    /// Drawn last, unaffected by the group opacity.
+    pub overlay_sprites: Vec<Sprite>,
+    pub overlay_labels: Vec<LabelDraw>,
+    /// Runs of group sprites/labels clipped to a rectangle.
+    group_clips: Vec<ClipSpan>,
+}
+
+/// A position in the group lists, taken before drawing content that will be clipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupMark {
+    sprites: usize,
+    labels: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ClipSpan {
+    sprites: Range<usize>,
+    labels: Range<usize>,
+    rect: Rect,
 }
 
 impl UiFrame {
@@ -121,8 +205,44 @@ impl UiFrame {
         self.group_sprites.clear();
         self.group_labels.clear();
         self.group_opacity = 0.0;
+        self.overlay_sprites.clear();
+        self.overlay_labels.clear();
+        self.group_clips.clear();
+    }
+
+    pub fn group_mark(&self) -> GroupMark {
+        GroupMark {
+            sprites: self.group_sprites.len(),
+            labels: self.group_labels.len(),
+        }
+    }
+
+    /// Clips the group sprites and labels added since `mark` to `rect` (physical pixels).
+    /// Nested clips intersect.
+    pub fn clip_group_since(&mut self, mark: GroupMark, rect: Rect) {
+        self.group_clips.push(ClipSpan {
+            sprites: mark.sprites..self.group_sprites.len(),
+            labels: mark.labels..self.group_labels.len(),
+            rect,
+        });
+    }
+
+    fn sprite_clip(&self, index: usize) -> Option<Rect> {
+        clip_for(&self.group_clips, |span| span.sprites.contains(&index))
     }
 }
+
+/// The intersection of all spans that contain an item; `None` when none does.
+fn clip_for(spans: &[ClipSpan], contains: impl Fn(&ClipSpan) -> bool) -> Option<Rect> {
+    spans
+        .iter()
+        .filter(|span| contains(span))
+        .map(|span| span.rect)
+        .reduce(|a, b| a.intersect(&b))
+}
+
+/// Clip rectangle for unclipped sprites: far larger than any surface.
+const NO_CLIP: [f32; 4] = [-1.0e9, -1.0e9, 1.0e9, 1.0e9];
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -131,6 +251,10 @@ struct SpriteVertex {
     uv: [f32; 2],
     glow: [f32; 4],
     params: [f32; 4],
+    tint: [f32; 4],
+    /// min x, min y, max x, max y in physical pixels.
+    clip: [f32; 4],
+    gamma: f32,
 }
 
 #[repr(C)]
@@ -235,6 +359,9 @@ impl UiRenderer {
             1 => Float32x2,
             2 => Float32x4,
             3 => Float32x4,
+            4 => Float32x4,
+            5 => Float32x4,
+            6 => Float32,
         ];
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ui sprite pipeline"),
@@ -370,8 +497,13 @@ impl UiRenderer {
     }
 
     /// Registers a text label; it is shaped lazily at the size it is drawn with.
-    pub fn create_label(&mut self, text: &str) -> LabelId {
-        self.text.create_label(text)
+    pub fn create_label(&mut self, text: &str, style: TextStyle) -> LabelId {
+        self.text.create_label(text, style)
+    }
+
+    /// Replaces a label's text; it is re-shaped on next use only if the text changed.
+    pub fn set_label_text(&mut self, label: LabelId, text: &str) {
+        self.text.set_label_text(label, text);
     }
 
     /// Encodes the UI passes for one frame into `encoder`.
@@ -397,9 +529,23 @@ impl UiRenderer {
         self.build_geometry(frame, size, draw_group);
         self.upload_geometry(target.device, target.queue);
         if draw_group {
-            self.text
-                .prepare(target.device, target.queue, size, &frame.group_labels);
+            self.text.prepare(
+                target.device,
+                target.queue,
+                size,
+                TextPass::Group,
+                &frame.group_labels,
+                &frame.group_clips,
+            );
         }
+        self.text.prepare(
+            target.device,
+            target.queue,
+            size,
+            TextPass::Overlay,
+            &frame.overlay_labels,
+            &[],
+        );
 
         if draw_group && let Some(group) = &self.group {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -416,7 +562,7 @@ impl UiRenderer {
                 ..Default::default()
             });
             self.draw_commands(&mut pass, &self.group_commands);
-            self.text.render(&mut pass);
+            self.text.render(TextPass::Group, &mut pass);
         }
 
         {
@@ -434,6 +580,7 @@ impl UiRenderer {
                 ..Default::default()
             });
             self.draw_commands(&mut pass, &self.surface_commands);
+            self.text.render(TextPass::Overlay, &mut pass);
         }
 
         self.text.trim();
@@ -500,8 +647,9 @@ impl UiRenderer {
         self.surface_commands.clear();
 
         if draw_group {
-            for sprite in &frame.group_sprites {
-                let range = push_sprite(&mut self.vertices, &mut self.indices, sprite);
+            for (index, sprite) in frame.group_sprites.iter().enumerate() {
+                let clip = frame.sprite_clip(index);
+                let range = push_sprite(&mut self.vertices, &mut self.indices, sprite, clip);
                 push_command(
                     &mut self.group_commands,
                     Binding::Set(sprite.textures.0),
@@ -510,7 +658,7 @@ impl UiRenderer {
             }
         }
         for sprite in &frame.background {
-            let range = push_sprite(&mut self.vertices, &mut self.indices, sprite);
+            let range = push_sprite(&mut self.vertices, &mut self.indices, sprite, None);
             push_command(
                 &mut self.surface_commands,
                 Binding::Set(sprite.textures.0),
@@ -529,8 +677,16 @@ impl UiRenderer {
                     ..SpriteMaterial::PLAIN
                 },
             };
-            let range = push_sprite(&mut self.vertices, &mut self.indices, &composite);
+            let range = push_sprite(&mut self.vertices, &mut self.indices, &composite, None);
             push_command(&mut self.surface_commands, Binding::Group, range);
+        }
+        for sprite in &frame.overlay_sprites {
+            let range = push_sprite(&mut self.vertices, &mut self.indices, sprite, None);
+            push_command(
+                &mut self.surface_commands,
+                Binding::Set(sprite.textures.0),
+                range,
+            );
         }
     }
 
@@ -601,7 +757,9 @@ fn push_sprite(
     vertices: &mut Vec<SpriteVertex>,
     indices: &mut Vec<u32>,
     sprite: &Sprite,
+    clip: Option<Rect>,
 ) -> Range<u32> {
+    let clip = clip.map_or(NO_CLIP, |r| [r.x, r.y, r.x + r.w, r.y + r.h]);
     let m = sprite.material;
     let glow = [
         m.glow_color[0],
@@ -617,6 +775,9 @@ fn push_sprite(
         uv,
         glow,
         params,
+        tint: m.tint,
+        clip,
+        gamma: m.gamma,
     };
 
     match sprite.shape {
@@ -670,17 +831,28 @@ fn push_command(commands: &mut Vec<DrawCommand>, binding: Binding, indices: Rang
 struct Label {
     buffer: Buffer,
     text: String,
-    /// Font size and width the buffer was last shaped for (0 = never).
-    shaped_size: [f32; 2],
+    style: TextStyle,
+    /// Font size and width the buffer was last shaped for; `None` = needs shaping.
+    shaped_size: Option<[f32; 2]>,
 }
 
-/// glyphon-based text. Labels are shaped once per size and cached.
+/// Which text renderer a label list goes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextPass {
+    Group,
+    Overlay,
+}
+
+/// glyphon-based text. Labels are shaped once per size and cached. The group and the
+/// overlay are drawn in different passes, so each has its own renderer; both share one
+/// glyph atlas.
 struct TextLayer {
     font_system: FontSystem,
     swash_cache: SwashCache,
     viewport: Viewport,
     atlas: TextAtlas,
-    renderer: TextRenderer,
+    group_renderer: TextRenderer,
+    overlay_renderer: TextRenderer,
     labels: Vec<Label>,
 }
 
@@ -688,18 +860,18 @@ impl TextLayer {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let started = std::time::Instant::now();
         let mut font_system = FontSystem::new();
-        let family = SERIF_CANDIDATES.into_iter().find(|candidate| {
+        let family = SANS_CANDIDATES.into_iter().find(|candidate| {
             font_system
                 .db()
                 .faces()
                 .any(|face| face.families.iter().any(|(name, _)| name == candidate))
         });
         match family {
-            Some(family) => font_system.db_mut().set_serif_family(family),
-            None => tracing::warn!("no preferred serif font installed; using the default"),
+            Some(family) => font_system.db_mut().set_sans_serif_family(family),
+            None => tracing::warn!("no preferred sans-serif font installed; using the default"),
         }
         tracing::info!(
-            serif = family.unwrap_or("default"),
+            sans_serif = family.unwrap_or("default"),
             faces = font_system.db().len(),
             elapsed_ms = started.elapsed().as_millis(),
             "fonts loaded"
@@ -713,26 +885,39 @@ impl TextLayer {
             ColorMode::Web
         };
         let mut atlas = TextAtlas::with_color_mode(device, queue, &cache, format, color_mode);
-        let renderer =
+        let group_renderer =
+            TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+        let overlay_renderer =
             TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
         Self {
             font_system,
             swash_cache: SwashCache::new(),
             viewport,
             atlas,
-            renderer,
+            group_renderer,
+            overlay_renderer,
             labels: Vec::new(),
         }
     }
 
-    fn create_label(&mut self, text: &str) -> LabelId {
+    fn create_label(&mut self, text: &str, style: TextStyle) -> LabelId {
         let buffer = Buffer::new(&mut self.font_system, Metrics::new(16.0, 20.0));
         self.labels.push(Label {
             buffer,
             text: text.to_owned(),
-            shaped_size: [0.0; 2],
+            style,
+            shaped_size: None,
         });
         LabelId(self.labels.len() - 1)
+    }
+
+    fn set_label_text(&mut self, label: LabelId, text: &str) {
+        if let Some(label) = self.labels.get_mut(label.0)
+            && label.text != text
+        {
+            text.clone_into(&mut label.text);
+            label.shaped_size = None;
+        }
     }
 
     fn prepare(
@@ -740,14 +925,16 @@ impl TextLayer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         size: [u32; 2],
+        pass: TextPass,
         draws: &[LabelDraw],
+        clips: &[ClipSpan],
     ) {
         for draw in draws {
             let Some(label) = self.labels.get_mut(draw.label.0) else {
                 continue;
             };
             let font_size = draw.font_size.max(1.0);
-            if label.shaped_size == [font_size, draw.rect.w] {
+            if label.shaped_size == Some([font_size, draw.rect.w]) {
                 continue;
             }
             let line_height = (font_size * LINE_HEIGHT_FACTOR).ceil();
@@ -756,16 +943,26 @@ impl TextLayer {
                 Some(draw.rect.w),
                 Some(line_height),
             );
+            let weight = if label.style.bold {
+                Weight::BOLD
+            } else {
+                Weight::NORMAL
+            };
+            let align = match label.style.align {
+                TextAlign::Left => Align::Left,
+                TextAlign::Center => Align::Center,
+                TextAlign::Right => Align::Right,
+            };
             label.buffer.set_text(
                 &label.text,
-                &Attrs::new().family(Family::Serif),
+                &Attrs::new().family(Family::SansSerif).weight(weight),
                 Shaping::Advanced,
-                Some(Align::Center),
+                Some(align),
             );
             label
                 .buffer
                 .shape_until_scroll(&mut self.font_system, false);
-            label.shaped_size = [font_size, draw.rect.w];
+            label.shaped_size = Some([font_size, draw.rect.w]);
         }
 
         self.viewport.update(
@@ -776,26 +973,37 @@ impl TextLayer {
             },
         );
         let labels = &self.labels;
-        let areas = draws.iter().filter_map(|draw| {
+        let areas = draws.iter().enumerate().filter_map(|(index, draw)| {
             let label = labels.get(draw.label.0)?;
             let line_height = label.buffer.metrics().line_height;
             let [r, g, b, a] = draw.color;
+            let bounds = match clip_for(clips, |span| span.labels.contains(&index)) {
+                Some(clip) => draw.rect.intersect(&clip),
+                None => draw.rect,
+            };
+            if bounds.w <= 0.0 || bounds.h <= 0.0 {
+                return None;
+            }
             Some(TextArea {
                 buffer: &label.buffer,
                 left: draw.rect.x,
                 top: draw.rect.y + ((draw.rect.h - line_height) / 2.0).round(),
                 scale: 1.0,
                 bounds: TextBounds {
-                    left: draw.rect.x.floor() as i32,
-                    top: draw.rect.y.floor() as i32,
-                    right: (draw.rect.x + draw.rect.w).ceil() as i32,
-                    bottom: (draw.rect.y + draw.rect.h).ceil() as i32,
+                    left: bounds.x.floor() as i32,
+                    top: bounds.y.floor() as i32,
+                    right: (bounds.x + bounds.w).ceil() as i32,
+                    bottom: (bounds.y + bounds.h).ceil() as i32,
                 },
                 default_color: Color::rgba(r, g, b, a),
                 custom_glyphs: &[],
             })
         });
-        if let Err(error) = self.renderer.prepare(
+        let renderer = match pass {
+            TextPass::Group => &mut self.group_renderer,
+            TextPass::Overlay => &mut self.overlay_renderer,
+        };
+        if let Err(error) = renderer.prepare(
             device,
             queue,
             &mut self.font_system,
@@ -808,8 +1016,12 @@ impl TextLayer {
         }
     }
 
-    fn render(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if let Err(error) = self.renderer.render(&self.atlas, &self.viewport, pass) {
+    fn render(&self, which: TextPass, pass: &mut wgpu::RenderPass<'_>) {
+        let renderer = match which {
+            TextPass::Group => &self.group_renderer,
+            TextPass::Overlay => &self.overlay_renderer,
+        };
+        if let Err(error) = renderer.render(&self.atlas, &self.viewport, pass) {
             tracing::error!("failed to render text: {error}");
         }
     }
@@ -839,8 +1051,10 @@ mod tests {
             rect: Rect::new(10.0, 20.0, 30.0, 40.0),
             uv: Rect::new(0.0, 0.0, 1.0, 1.0),
         };
-        let range = push_sprite(&mut vertices, &mut indices, &sprite(0, shape));
+        let range = push_sprite(&mut vertices, &mut indices, &sprite(0, shape), None);
         assert_eq!(range, 0..6);
+        assert_eq!(vertices[0].clip, NO_CLIP);
+        assert_eq!(vertices[0].gamma, 1.0);
         assert_eq!(vertices.len(), 4);
         assert_eq!(vertices[3].position, [40.0, 60.0]);
         assert_eq!(vertices[3].uv, [1.0, 1.0]);
@@ -860,10 +1074,60 @@ mod tests {
             &mut vertices,
             &mut indices,
             &sprite(0, SpriteShape::NineSlice(layout)),
+            Some(Rect::new(5.0, 6.0, 10.0, 20.0)),
         );
+        assert_eq!(vertices[0].clip, [5.0, 6.0, 15.0, 26.0]);
         assert_eq!(range, 0..54);
         assert_eq!(vertices.len(), 16);
         assert!(indices.iter().all(|&index| index < 16));
+    }
+
+    #[test]
+    fn sprite_shader_parses_and_validates() {
+        let source = include_str!("../../../shaders/ui_sprite.wgsl");
+        let module = match naga::front::wgsl::parse_str(source) {
+            Ok(module) => module,
+            Err(error) => panic!("{}", error.emit_to_string(source)),
+        };
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        );
+        if let Err(error) = validator.validate(&module) {
+            panic!("{}", error.emit_to_string(source));
+        }
+    }
+
+    #[test]
+    fn clips_cover_the_marked_run_and_nest() {
+        let mut frame = UiFrame::default();
+        let plain = sprite(
+            0,
+            SpriteShape::Stretched {
+                rect: Rect::new(0.0, 0.0, 1.0, 1.0),
+                uv: Rect::new(0.0, 0.0, 1.0, 1.0),
+            },
+        );
+        frame.group_sprites.push(plain);
+        let outer = frame.group_mark();
+        frame.group_sprites.push(plain);
+        let inner = frame.group_mark();
+        frame.group_sprites.push(plain);
+        frame.clip_group_since(inner, Rect::new(50.0, 0.0, 100.0, 100.0));
+        frame.clip_group_since(outer, Rect::new(0.0, 0.0, 100.0, 100.0));
+        frame.group_sprites.push(plain);
+        assert_eq!(frame.sprite_clip(0), None, "before the mark");
+        assert_eq!(
+            frame.sprite_clip(1),
+            Some(Rect::new(0.0, 0.0, 100.0, 100.0))
+        );
+        assert_eq!(
+            frame.sprite_clip(2),
+            Some(Rect::new(50.0, 0.0, 50.0, 100.0))
+        );
+        assert_eq!(frame.sprite_clip(3), None, "after the span");
+        frame.clear();
+        assert!(frame.group_clips.is_empty());
     }
 
     #[test]

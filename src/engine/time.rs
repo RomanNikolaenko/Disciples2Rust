@@ -38,6 +38,38 @@ pub struct FrameSummary {
     pub worst: Duration,
 }
 
+/// Frames per second averaged over short windows, for an on-screen counter (updating
+/// every frame would be unreadable).
+#[derive(Debug)]
+pub struct FpsCounter {
+    window: Duration,
+    elapsed: Duration,
+    frames: u32,
+}
+
+impl FpsCounter {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            elapsed: Duration::ZERO,
+            frames: 0,
+        }
+    }
+
+    /// Records one frame time; returns the average FPS each time a window completes.
+    pub fn record(&mut self, frame_time: Duration) -> Option<u32> {
+        self.elapsed += frame_time;
+        self.frames += 1;
+        if self.elapsed < self.window {
+            return None;
+        }
+        let fps = (f64::from(self.frames) / self.elapsed.as_secs_f64()).round() as u32;
+        self.elapsed = Duration::ZERO;
+        self.frames = 0;
+        Some(fps)
+    }
+}
+
 /// Accumulates frame times and emits a [`FrameSummary`] once per interval.
 #[derive(Debug)]
 pub struct FrameStats {
@@ -116,6 +148,20 @@ mod tests {
             clock.tick(start - Duration::from_millis(5)),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn fps_counter_averages_over_its_window() {
+        let mut counter = FpsCounter::new(Duration::from_millis(500));
+        for _ in 0..29 {
+            assert_eq!(counter.record(Duration::from_micros(16_667)), None);
+        }
+        assert_eq!(counter.record(Duration::from_micros(16_667)), Some(60));
+        // The next window starts from scratch: 30 FPS frames.
+        for _ in 0..14 {
+            assert_eq!(counter.record(Duration::from_micros(33_334)), None);
+        }
+        assert_eq!(counter.record(Duration::from_micros(33_334)), Some(30));
     }
 
     #[test]
