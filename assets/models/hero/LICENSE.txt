@@ -1,0 +1,17 @@
+sword_and_shield_run.fbx — a character from Adobe Mixamo (https://www.mixamo.com)
+with its "Sword And Shield Run" animation, downloaded by the project's author
+("Sword And Shield Run.fbx"), unmodified.
+
+License: Mixamo's terms. Characters and animations may be used royalty-free in
+games and other projects, but not redistributed or sold as standalone files.
+It is NOT covered by CC0. It is therefore not published with the project
+(.gitignore): checkouts without it skip the loader tests that use it.
+
+knight.fbx — the game's hero: "LowPoly Animated Knight" by Quaternius (KnightCharacter.fbx from
+"Knight Character by @Quaternius.zip"), unmodified.
+
+License: CC0 1.0 Universal (public domain dedication).
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Source: https://opengameart.org/content/lowpoly-animated-knight
+Also published at https://quaternius.itch.io/lowpoly-animated-knight

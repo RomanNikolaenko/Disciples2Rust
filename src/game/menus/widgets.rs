@@ -1,4 +1,5 @@
-//! Widgets shared by the menu screens, and the art they are drawn with.
+//! Widgets shared by the menu screens and the world map's interface, and the art they
+//! are drawn with.
 //!
 //! All geometry is in physical pixels; screens compute rects from their 1920x1080
 //! reference layout times the UI scale.
@@ -17,7 +18,23 @@ use crate::engine::ui::hit::{
     AlphaMask, DEFAULT_ALPHA_THRESHOLD, Hit, HitShape, HitTarget, topmost_hit,
 };
 use crate::game::locale::Language;
-use crate::game::settings::MAX_VOLUME;
+use crate::game::settings::{DisplaySettings, MAX_VOLUME};
+
+/// Uniform UI scale relative to the 1920x1080 reference.
+pub fn ui_scale(viewport: [f32; 2]) -> f32 {
+    (viewport[0] / REFERENCE_SIZE[0]).min(viewport[1] / REFERENCE_SIZE[1])
+}
+
+/// Material for the game image (menu background, world map): brightness and gamma
+/// calibrate it in linear light, while the interface keeps its colors.
+pub fn game_image_material(display: &DisplaySettings) -> SpriteMaterial {
+    let factor = display.brightness_factor();
+    SpriteMaterial {
+        tint: [factor, factor, factor, 1.0],
+        gamma: display.gamma_value(),
+        ..SpriteMaterial::PLAIN
+    }
+}
 
 /// sRGB colors shared by the menus (sampled from the mockups).
 pub mod palette {

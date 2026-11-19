@@ -1,13 +1,15 @@
 [package]
 name = "disciples2_rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
 bytemuck = { version = "1.25.2", features = ["derive"] }
+glam = "0.34.3"
 glyphon = "0.12.0"
-image = { version = "0.25.10", default-features = false, features = ["png", "webp"] }
+# PNG/WebP for UI art; JPEG for model textures as artists ship them.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 pollster = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }
 # Verifies downloaded update packages.
@@ -16,6 +18,9 @@ thiserror = "2.0.21"
 toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# FBX models (meshes, skeletons, animations): bindings to the single-file ufbx C library,
+# compiled by its build script (needs a C compiler: MSVC on Windows, cc/gcc on Linux).
+ufbx = "0.11.5"
 # Update checks and downloads from GitHub Releases (rustls + ring, no system TLS).
 ureq = { version = "3.5.2", features = ["json"] }
 # The wgpu major version must match glyphon 0.12 (GPU text rendering), which depends
@@ -27,6 +32,11 @@ winit = "0.30.13"
 [dev-dependencies]
 # WGSL validation in tests; same version wgpu already uses, so nothing extra is built.
 naga = { version = "30.0.2", features = ["wgsl-in"] }
+# EXR decoding for examples/import_ground_textures.rs only (scanned surfaces ship as
+# EXR); the game itself reads the converted WebP files.
+image = { version = "0.25.10", default-features = false, features = ["exr"] }
+# The same EXR reader image uses, directly: for maps whose channels are not plain R/G/B.
+exr = "1.74.3"
 
 # wgpu/naga are very slow without optimizations. Optimize dependencies in dev builds so
 # debug runs stay interactive; our own crate keeps opt-level 0 for fast rebuilds.

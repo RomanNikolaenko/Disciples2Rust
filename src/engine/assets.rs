@@ -26,7 +26,7 @@ pub enum AssetError {
 }
 
 /// RGBA8 pixels, row-major, sRGB-encoded color.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RgbaImage {
     pub width: u32,
     pub height: u32,
@@ -43,6 +43,49 @@ impl RgbaImage {
             pixels,
         }
     }
+}
+
+/// Heights 0..1, row-major (from a grayscale image, 16-bit for smooth slopes).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeightImage {
+    pub width: u32,
+    pub height: u32,
+    pub values: Vec<f32>,
+}
+
+impl HeightImage {
+    /// The height at (`u`, `v`) (0..1 across, pixel centers at (i + 0.5) / side),
+    /// bilinear, clamped at the borders.
+    pub fn sample(&self, u: f32, v: f32) -> f32 {
+        if self.values.is_empty() {
+            return 0.0;
+        }
+        let (w, h) = (self.width as usize, self.height as usize);
+        let x = (u * self.width as f32 - 0.5).clamp(0.0, (w - 1) as f32);
+        let y = (v * self.height as f32 - 0.5).clamp(0.0, (h - 1) as f32);
+        let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1));
+        let (fx, fy) = (x - x0 as f32, y - y0 as f32);
+        let at = |x: usize, y: usize| self.values[y * w + x];
+        let top = at(x0, y0) + (at(x1, y0) - at(x0, y0)) * fx;
+        let bottom = at(x0, y1) + (at(x1, y1) - at(x0, y1)) * fx;
+        top + (bottom - top) * fy
+    }
+}
+
+/// Loads a height map: a grayscale image (any bit depth), black 0, white 1.
+pub fn load_height(path: &Path) -> Result<HeightImage, AssetError> {
+    let image = decode(path)?.into_luma16();
+    let (width, height) = image.dimensions();
+    Ok(HeightImage {
+        width,
+        height,
+        values: image
+            .into_raw()
+            .into_iter()
+            .map(|value| f32::from(value) / 65535.0)
+            .collect(),
+    })
 }
 
 /// Single-channel (linear) image, row-major.

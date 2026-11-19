@@ -292,7 +292,8 @@ pub struct UiRenderer {
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     no_glow: wgpu::TextureView,
-    texture_sets: Vec<wgpu::BindGroup>,
+    /// `None` marks a released slot, reused by the next texture set.
+    texture_sets: Vec<Option<wgpu::BindGroup>>,
     group: Option<GroupTarget>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
@@ -501,8 +502,46 @@ impl UiRenderer {
             &base_view,
             glow_view.as_ref().unwrap_or(&self.no_glow),
         );
-        self.texture_sets.push(bind_group);
-        TextureSetId(self.texture_sets.len() - 1)
+        self.insert_texture_set(bind_group)
+    }
+
+    /// Registers a texture rendered elsewhere (premultiplied alpha, filterable, in a
+    /// format whose views read linear values), without a glow mask.
+    pub fn create_view_texture(
+        &mut self,
+        device: &wgpu::Device,
+        label: &str,
+        view: &wgpu::TextureView,
+    ) -> TextureSetId {
+        let bind_group = self.texture_bind_group(device, label, view, &self.no_glow);
+        self.insert_texture_set(bind_group)
+    }
+
+    /// Points a texture set at a new view (the old texture was recreated, e.g. resized).
+    pub fn replace_view_texture(
+        &mut self,
+        device: &wgpu::Device,
+        id: TextureSetId,
+        label: &str,
+        view: &wgpu::TextureView,
+    ) {
+        let bind_group = self.texture_bind_group(device, label, view, &self.no_glow);
+        if let Some(slot) = self.texture_sets.get_mut(id.0) {
+            *slot = Some(bind_group);
+        }
+    }
+
+    fn insert_texture_set(&mut self, bind_group: wgpu::BindGroup) -> TextureSetId {
+        match self.texture_sets.iter().position(Option::is_none) {
+            Some(slot) => {
+                self.texture_sets[slot] = Some(bind_group);
+                TextureSetId(slot)
+            }
+            None => {
+                self.texture_sets.push(Some(bind_group));
+                TextureSetId(self.texture_sets.len() - 1)
+            }
+        }
     }
 
     /// Registers a text label; it is shaped lazily at the size it is drawn with.
@@ -734,7 +773,7 @@ impl UiRenderer {
         pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         for command in commands {
             let bind_group = match command.binding {
-                Binding::Set(index) => self.texture_sets.get(index),
+                Binding::Set(index) => self.texture_sets.get(index).and_then(Option::as_ref),
                 Binding::Group => self.group.as_ref().map(|group| &group.bind_group),
             };
             let Some(bind_group) = bind_group else {

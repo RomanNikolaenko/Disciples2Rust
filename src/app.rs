@@ -1,7 +1,9 @@
 //! Application lifecycle: main window, GPU context and per-frame flow.
 //!
-//! Per-frame order (AGENTS.md): input events are dispatched to the menu as they arrive;
-//! on redraw: frame timing → menu update/animation → build UI frame → encode/submit.
+//! Per-frame order (AGENTS.md): input events are dispatched to the active screen (the
+//! menu, or the world map once a game runs) as they arrive; on redraw: frame timing →
+//! screen update/animation → build the UI and 3D frames → encode the 3D layer, then the
+//! UI passes that composite it → submit.
 //!
 //! Frame pacing: with V-Sync the present call paces frames; a frame rate limit (from
 //! Settings) additionally waits until the next frame deadline via `ControlFlow::WaitUntil`.
@@ -20,8 +22,11 @@ use winit::monitor::{MonitorHandle, VideoModeHandle};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::engine::assets::assets_dir;
+use crate::engine::render::scene_renderer::{
+    DEPTH_FORMAT, PREFERRED_SAMPLES, SceneFrame, SceneRenderer,
+};
 use crate::engine::render::ui_renderer::{
-    LabelDraw, LabelId, TextAlign, TextStyle, UiFrame, UiRenderer,
+    LabelDraw, LabelId, TextAlign, TextStyle, TextureSetId, UiFrame, UiRenderer,
 };
 use crate::engine::render::{FrameStatus, GpuContext};
 use crate::engine::time::{FpsCounter, FrameClock, FrameStats, MAX_ANIMATION_STEP};
@@ -33,6 +38,7 @@ use crate::game::settings::{
     settings_path,
 };
 use crate::game::update::{self, Updater};
+use crate::game::world::screen::{PanKey, WorldEvent, WorldScreen};
 
 const WINDOW_TITLE: &str = "Disciples2Rust";
 /// Smallest supported window client area, matching [`MIN_RESOLUTION`] in the display
@@ -47,12 +53,18 @@ const FPS_SHADOW: [u8; 4] = [0, 0, 0, 170];
 pub struct App {
     // Field order matters for drop order: UI resources and the GPU context (and its
     // surface) are dropped before the window they present to.
+    /// The world map while a game runs; it gets the input and the frame instead of the
+    /// menu, which stays alive (faded out) for the way back.
+    world: Option<WorldScreen>,
     menu: Option<MainMenu>,
+    /// The 3D layer, and the UI texture set that shows its image.
+    scene: Option<(SceneRenderer, TextureSetId)>,
     renderer: Option<UiRenderer>,
     gpu: Option<GpuContext>,
     window: Option<Arc<Window>>,
-    /// Render list rebuilt every frame; kept to reuse its allocations.
+    /// Render lists rebuilt every frame; kept to reuse their allocations.
     ui_frame: UiFrame,
+    scene_frame: SceneFrame,
     clock: FrameClock,
     stats: FrameStats,
     /// True while drawing is paused because the window has no drawable area.
@@ -83,11 +95,14 @@ impl App {
         update::clean_up_previous_update();
         let updater = Updater::start();
         Self {
+            world: None,
             menu: None,
+            scene: None,
             renderer: None,
             gpu: None,
             window: None,
             ui_frame: UiFrame::default(),
+            scene_frame: SceneFrame::default(),
             clock: FrameClock::default(),
             stats: FrameStats::new(FRAME_STATS_INTERVAL),
             paused: false,
@@ -190,7 +205,11 @@ impl App {
         event_loop: &ActiveEventLoop,
         window: &Arc<Window>,
     ) -> anyhow::Result<()> {
+        if self.world.take().is_some() {
+            tracing::warn!("the world map's GPU resources are gone; back to the main menu");
+        }
         self.menu = None;
+        self.scene = None;
         self.renderer = None;
         self.gpu = None;
         self.fps_label = None;
@@ -200,6 +219,7 @@ impl App {
             .map(|font| assets_dir().join(font))
             .collect();
         let mut renderer = UiRenderer::new(gpu.device(), gpu.queue(), gpu.surface_format(), &fonts);
+        self.scene = Some(create_scene_layer(&gpu, &mut renderer));
         let size = window.inner_size();
         // An older settings file may keep an aspect ratio this monitor cannot display.
         snap_aspect_ratio(
@@ -223,15 +243,20 @@ impl App {
 
     /// Builds this frame's UI and renders it. `None` if rendering is not initialized.
     fn draw(&mut self) -> Option<FrameStatus> {
-        let (Some(gpu), Some(renderer), Some(menu)) = (
+        let (Some(gpu), Some(renderer), Some(menu), Some((scene, scene_texture))) = (
             self.gpu.as_mut(),
             self.renderer.as_mut(),
             self.menu.as_mut(),
+            self.scene.as_mut(),
         ) else {
             return None;
         };
         self.ui_frame.clear();
-        menu.build_frame(renderer, &mut self.ui_frame);
+        self.scene_frame.clear();
+        match self.world.as_mut() {
+            Some(world) => world.build_frame(renderer, &mut self.ui_frame, &mut self.scene_frame),
+            None => menu.build_frame(renderer, &mut self.ui_frame),
+        }
         if self.settings.display.show_fps
             && let (Some(window), Some(fps)) = (&self.window, self.fps)
         {
@@ -253,7 +278,19 @@ impl App {
             );
         }
         let frame = &self.ui_frame;
-        Some(gpu.render_frame(|target, encoder| renderer.render(target, encoder, frame)))
+        let scene_frame = &self.scene_frame;
+        let scene_texture = *scene_texture;
+        Some(gpu.render_frame(|target, encoder| {
+            // The 3D layer first: the UI passes sample its image.
+            if !scene_frame.is_empty() {
+                if scene.ensure_target(target.device, [target.width, target.height]) {
+                    let view = scene.target_view();
+                    renderer.replace_view_texture(target.device, scene_texture, "3D layer", view);
+                }
+                scene.render(target, encoder, scene_frame);
+            }
+            renderer.render(target, encoder, frame);
+        }))
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -293,27 +330,19 @@ impl App {
         }
         let dt = frame_time.unwrap_or_default().min(MAX_ANIMATION_STEP);
 
-        match self
-            .menu
-            .as_mut()
-            .and_then(|menu| menu.update(dt.as_secs_f32()))
-        {
-            Some(MenuEvent::Exit) => {
-                event_loop.exit();
+        if let Some(world) = self.world.as_mut() {
+            if world.update(dt.as_secs_f32()) == Some(WorldEvent::ExitToMenu) {
+                if let (Some(world), Some((scene, _))) = (self.world.take(), self.scene.as_mut()) {
+                    world.release(scene);
+                }
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.resume();
+                }
+            }
+        } else {
+            if self.update_menu(event_loop, dt) {
                 return;
             }
-            Some(MenuEvent::Restart) => match update::restart() {
-                Ok(()) => {
-                    tracing::info!("restarting into the updated game");
-                    event_loop.exit();
-                    return;
-                }
-                Err(error) => tracing::error!("{error:#}"),
-            },
-            Some(MenuEvent::SettingsApplied { settings, save }) => {
-                self.apply_settings(settings, save);
-            }
-            None => {}
         }
 
         match self.draw() {
@@ -326,9 +355,69 @@ impl App {
         }
     }
 
+    /// Advances the menu and acts on what it reports. True when the game is quitting
+    /// (no more frames).
+    fn update_menu(&mut self, event_loop: &ActiveEventLoop, dt: Duration) -> bool {
+        match self
+            .menu
+            .as_mut()
+            .and_then(|menu| menu.update(dt.as_secs_f32()))
+        {
+            Some(MenuEvent::Exit) => {
+                event_loop.exit();
+                return true;
+            }
+            Some(MenuEvent::Restart) => match update::restart() {
+                Ok(()) => {
+                    tracing::info!("restarting into the updated game");
+                    event_loop.exit();
+                    return true;
+                }
+                Err(error) => tracing::error!("{error:#}"),
+            },
+            Some(MenuEvent::SettingsApplied { settings, save }) => {
+                self.apply_settings(settings, save);
+            }
+            Some(MenuEvent::NewGame) => self.start_game(),
+            None => {}
+        }
+        false
+    }
+
+    /// Opens the world map of a new game; on failure (missing or broken map files) the
+    /// menu comes back.
+    fn start_game(&mut self) {
+        let (Some(gpu), Some(renderer), Some(menu), Some(window), Some((scene, scene_texture))) = (
+            self.gpu.as_ref(),
+            self.renderer.as_mut(),
+            self.menu.as_mut(),
+            self.window.as_ref(),
+            self.scene.as_mut(),
+        ) else {
+            return;
+        };
+        let size = window.inner_size();
+        match WorldScreen::new(
+            gpu,
+            renderer,
+            scene,
+            *scene_texture,
+            menu.kit(),
+            &assets_dir(),
+            [size.width, size.height],
+            self.settings.display,
+        ) {
+            Ok(world) => self.world = Some(world),
+            Err(error) => {
+                tracing::error!("cannot start a new game: {error}");
+                menu.resume();
+            }
+        }
+    }
+
     /// Makes `settings` current: applies display changes and, when `save`, writes them
-    /// to disk. Audio and graphics values are only stored (no audio playback or 3D scene
-    /// exists yet).
+    /// to disk. Audio and graphics values are only stored (there is no audio playback
+    /// yet, and the 3D layer does not read the graphics settings yet).
     fn apply_settings(&mut self, mut settings: Settings, save: bool) {
         // A value the monitor cannot display (e.g. loaded from an older file) falls
         // back to Auto before anything sees it.
@@ -339,6 +428,9 @@ impl App {
         let previous = self.settings.display;
         self.settings = settings;
         let display = settings.display;
+        if let Some(world) = self.world.as_mut() {
+            world.set_display(display);
+        }
         if previous.window_changes(&display) {
             if let Some(window) = &self.window {
                 apply_window_mode(window, &display, self.window_frame);
@@ -441,6 +533,9 @@ impl App {
         if let Some(menu) = self.menu.as_mut() {
             menu.resize([size.width, size.height]);
         }
+        if let Some(world) = self.world.as_mut() {
+            world.resize([size.width, size.height]);
+        }
         let has_area = size.width > 0 && size.height > 0;
         if !has_area {
             // Pause here rather than waiting for a redraw: Windows delivers no redraws
@@ -526,6 +621,13 @@ impl ApplicationHandler for App {
                 if !focused && let Some(menu) = self.menu.as_mut() {
                     menu.focus_lost();
                 }
+                if let Some(world) = self.world.as_mut() {
+                    if focused {
+                        world.focus_gained();
+                    } else {
+                        world.focus_lost();
+                    }
+                }
                 // Leave a long background wait right away when focus returns.
                 if focused && let Some(window) = &self.window {
                     window.request_redraw();
@@ -536,11 +638,18 @@ impl ApplicationHandler for App {
                 if let Some(menu) = self.menu.as_mut() {
                     menu.pointer_entered();
                 }
+                if let Some(world) = self.world.as_mut() {
+                    world.pointer_entered();
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 tracing::trace!(x = position.x, y = position.y, "cursor moved");
+                let (x, y) = (position.x as f32, position.y as f32);
                 if let Some(menu) = self.menu.as_mut() {
-                    menu.pointer_moved(position.x as f32, position.y as f32);
+                    menu.pointer_moved(x, y);
+                }
+                if let Some(world) = self.world.as_mut() {
+                    world.pointer_moved(x, y);
                 }
             }
             WindowEvent::CursorLeft { .. } => {
@@ -548,9 +657,19 @@ impl ApplicationHandler for App {
                 if let Some(menu) = self.menu.as_mut() {
                     menu.pointer_left();
                 }
+                if let Some(world) = self.world.as_mut() {
+                    world.pointer_left();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(menu) = self.menu.as_mut() {
+                if let Some(world) = self.world.as_mut() {
+                    match delta {
+                        MouseScrollDelta::LineDelta(_, lines) => world.scroll_lines(lines),
+                        MouseScrollDelta::PixelDelta(offset) => {
+                            world.scroll_pixels(offset.y as f32);
+                        }
+                    }
+                } else if let Some(menu) = self.menu.as_mut() {
                     match delta {
                         MouseScrollDelta::LineDelta(_, lines) => menu.scroll_lines(lines),
                         MouseScrollDelta::PixelDelta(offset) => {
@@ -559,15 +678,23 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                if let Some(menu) = self.menu.as_mut() {
-                    match state {
-                        ElementState::Pressed => menu.pointer_pressed(),
-                        ElementState::Released => menu.pointer_released(),
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                if let Some(world) = self.world.as_mut() {
+                    match (button, pressed) {
+                        (MouseButton::Left, true) => world.pointer_pressed(),
+                        (MouseButton::Left, false) => world.pointer_released(),
+                        (MouseButton::Right | MouseButton::Middle, true) => world.drag_pressed(),
+                        (MouseButton::Right | MouseButton::Middle, false) => world.drag_released(),
+                        _ => {}
+                    }
+                } else if button == MouseButton::Left
+                    && let Some(menu) = self.menu.as_mut()
+                {
+                    if pressed {
+                        menu.pointer_pressed();
+                    } else {
+                        menu.pointer_released();
                     }
                 }
             }
@@ -577,7 +704,17 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 // Synthetic presses replay keys held while focus was elsewhere.
-                if is_synthetic || event.state != ElementState::Pressed || event.repeat {
+                if is_synthetic {
+                    return;
+                }
+                // Map panning follows key presses and releases (held keys).
+                if let Some(world) = self.world.as_mut()
+                    && let Some(key) = pan_key(event.physical_key)
+                {
+                    world.pan_key(key, event.state == ElementState::Pressed);
+                    return;
+                }
+                if event.state != ElementState::Pressed || event.repeat {
                     return;
                 }
                 if is_fullscreen_toggle(
@@ -587,6 +724,15 @@ impl ApplicationHandler for App {
                     self.modifiers.alt_key(),
                 ) {
                     self.toggle_fullscreen();
+                } else if let (Some(key), Some(world)) = (
+                    menu_key(event.physical_key, self.modifiers.shift_key()),
+                    self.world.as_mut(),
+                ) {
+                    match key {
+                        MenuKey::Back => world.back(),
+                        MenuKey::Activate => world.activate(),
+                        _ => {}
+                    }
                 } else if let (Some(key), Some(menu)) = (
                     menu_key(event.physical_key, self.modifiers.shift_key()),
                     self.menu.as_mut(),
@@ -934,6 +1080,38 @@ fn menu_key(key: PhysicalKey, shift: bool) -> Option<MenuKey> {
     })
 }
 
+/// The 3D layer with multisampling where the adapter supports it, and the UI texture
+/// set that shows its image (repointed whenever the layer's target is resized).
+fn create_scene_layer(
+    gpu: &GpuContext,
+    renderer: &mut UiRenderer,
+) -> (SceneRenderer, TextureSetId) {
+    let format = gpu.surface_format();
+    let samples = if gpu.supports_multisampling(&[format, DEPTH_FORMAT], PREFERRED_SAMPLES) {
+        PREFERRED_SAMPLES
+    } else {
+        tracing::warn!("no {PREFERRED_SAMPLES}x multisampling for the 3D layer; edges will alias");
+        1
+    };
+    let scene = SceneRenderer::new(gpu.device(), gpu.queue(), format, samples);
+    let texture = renderer.create_view_texture(gpu.device(), "3D layer", scene.target_view());
+    (scene, texture)
+}
+
+/// WASD (by position, so any keyboard layout) and the arrow keys pan the world map.
+fn pan_key(key: PhysicalKey) -> Option<PanKey> {
+    let PhysicalKey::Code(code) = key else {
+        return None;
+    };
+    Some(match code {
+        KeyCode::KeyA | KeyCode::ArrowLeft => PanKey::Left,
+        KeyCode::KeyD | KeyCode::ArrowRight => PanKey::Right,
+        KeyCode::KeyW | KeyCode::ArrowUp => PanKey::Up,
+        KeyCode::KeyS | KeyCode::ArrowDown => PanKey::Down,
+        _ => return None,
+    })
+}
+
 /// F11, or Alt+Enter (the Windows convention), toggles fullscreen. Key repeats are
 /// ignored so holding the keys does not flip between modes.
 fn is_fullscreen_toggle(key: PhysicalKey, state: ElementState, repeat: bool, alt: bool) -> bool {
@@ -1014,6 +1192,16 @@ mod tests {
         let deadline = next_frame_deadline(start, Some(60)).unwrap();
         let period = deadline - start;
         assert!(period > Duration::from_micros(16_600) && period < Duration::from_micros(16_700));
+    }
+
+    #[test]
+    fn wasd_and_arrows_pan_the_map() {
+        let key = |code| PhysicalKey::Code(code);
+        assert_eq!(pan_key(key(KeyCode::KeyW)), Some(PanKey::Up));
+        assert_eq!(pan_key(key(KeyCode::ArrowDown)), Some(PanKey::Down));
+        assert_eq!(pan_key(key(KeyCode::KeyA)), Some(PanKey::Left));
+        assert_eq!(pan_key(key(KeyCode::ArrowRight)), Some(PanKey::Right));
+        assert_eq!(pan_key(key(KeyCode::Escape)), None);
     }
 
     #[test]

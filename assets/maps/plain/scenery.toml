@@ -1,0 +1,175 @@
+# Scenery of this map: the ground and what stands on its tiles. Read by
+# src/game/world/scenery.rs.
+version = 1
+
+# Relief: copies ("hills") of landscape height maps (ambientCG Terrain001-005, CC0, made
+# into 16-bit PNGs by examples/import_ground_textures.rs `height`; see
+# assets/textures/terrain/SOURCES.md), raised out of the plain. `map` is the hills' height
+# map unless a hill names its own; `floor` is the share of a height map's range that stays
+# plain. Each hill is centered `at` a map point, `size` tiles across, its highest point
+# `peak` tiles up, turned by `turn` degrees. Hills sink to nothing at their rims and by
+# the map's edges. The ground, the props and the figures stand on the relief.
+[heights]
+map = "textures/terrain/terrain001_height.png"
+floor = 0.15
+
+# One mountain range in each land, each of its own kind; the middle one is set aside
+# so that the hero's start (24, 24) stays in the valley.
+
+# 1. The middle: a central massif (Terrain001).
+[[heights.hills]]
+at = [30, 18]
+size = 16
+peak = 4
+turn = 40
+
+# 2. The burning land: a ring of peaks around a crater (Terrain003).
+[[heights.hills]]
+at = [24, 9]
+size = 17
+peak = 4
+turn = 0
+map = "textures/terrain/terrain003_height.png"
+
+# 3. The dead land: a worn plateau cut by gullies (Terrain004).
+[[heights.hills]]
+at = [38, 19]
+size = 16
+peak = 3
+turn = 72
+map = "textures/terrain/terrain004_height.png"
+
+# 4. Snow: a high massif with long ridges (Terrain002).
+[[heights.hills]]
+at = [33, 36]
+size = 16
+peak = 4
+turn = 144
+map = "textures/terrain/terrain002_height.png"
+
+# 5. Green land: hills around a sheltered valley (Terrain005).
+[[heights.hills]]
+at = [15, 36]
+size = 16
+peak = 3.5
+turn = 216
+map = "textures/terrain/terrain005_height.png"
+
+# 6. The autumn garden: a massif again (Terrain001), turned another way.
+[[heights.hills]]
+at = [10, 19]
+size = 16
+peak = 4
+turn = 288
+
+# The ground: photographed surfaces (made by examples/import_ground_textures.rs from
+# Poly Haven scans, CC0, see assets/textures/ground_cc0/SOURCES.md), lit by the sun.
+# `brightness` multiplies their colors, `relief` their normal maps' slopes.
+#
+# `lands` share the map out: each place belongs to the nearest point's land, the
+# borders wandering a little and blending over about `border` tiles.
+#
+# Layers are painted in order, each over the ones before: `land` names the land it lies
+# in (1: the first; none: every land), `terrain` where it lies, `cover` the share of
+# that area it takes (1: all of it), in patches about `patch` tiles wide that fade out
+# gradually by `edge` (0..1); `size` is how many tiles one repeat of its textures covers.
+# `saturation` (0: gray) and `tint` change its color; `glow` lights its cracks (lava),
+# up to height `glow_depth` (0..1).
+# Layers of one `field` share their patches (give them the same `patch`): a smaller
+# share lies inside a larger one. Where layers meet, the higher surface shows through.
+# At most 8 layers.
+[ground]
+brightness = 1.0
+relief = 1.5
+# 1: the middle, where the hero starts; then five around it.
+lands = [[24, 24], [24, 5], [42, 18], [35, 39], [13, 39], [6, 18]]
+border = 2.0
+
+# 1. Dark, earthy grass ground (Poly Haven, scan: 2.5 m).
+[[ground.layers]]
+color = "textures/ground_cc0/grass_ground_color.webp"
+normal = "textures/ground_cc0/grass_ground_normal.webp"
+size = 4.0
+terrain = ["plains"]
+land = 1
+tint = [0.65, 0.624, 0.546]
+
+# 2. Burning land: dark stones with lava glowing between them (Poly Haven rocks
+# ground, scan: 2 m).
+[[ground.layers]]
+color = "textures/ground_cc0/rocks_ground_02_color.webp"
+normal = "textures/ground_cc0/rocks_ground_02_normal.webp"
+size = 4.0
+terrain = ["plains"]
+land = 2
+tint = [0.14, 0.075, 0.042]
+glow = [1.0, 0.025, 0.004]
+glow_depth = 0.08
+
+# 3. Dead land: gray litter and twigs (Poly Haven forest floor, scan: 2.1 m), drained of
+# color.
+[[ground.layers]]
+color = "textures/ground_cc0/forest_floor_color.webp"
+normal = "textures/ground_cc0/forest_floor_normal.webp"
+size = 3.4
+terrain = ["plains"]
+land = 3
+saturation = 0.3
+tint = [0.098, 0.095, 0.055]
+
+# 4. Snow (Poly Haven snow, scan: 2 m), a little cool.
+[[ground.layers]]
+color = "textures/ground_cc0/snow_02_color.webp"
+normal = "textures/ground_cc0/snow_02_normal.webp"
+size = 3.2
+terrain = ["plains"]
+land = 4
+saturation = 0.0
+tint = [2.84, 2.91, 3.07]
+
+# 5. Green grass (Poly Haven leafy grass, scan: 2 m), turned deep green.
+[[ground.layers]]
+color = "textures/ground_cc0/leafy_grass_color.webp"
+normal = "textures/ground_cc0/leafy_grass_normal.webp"
+size = 3.2
+terrain = ["plains"]
+land = 5
+tint = [0.066, 0.243, 0.079]
+
+# 6. Autumn garden: fallen leaves, orange and yellow (Poly Haven forest ground, scan:
+# 2 m; its colors pushed apart, then warmed).
+[[ground.layers]]
+color = "textures/ground_cc0/forrest_ground_01_color.webp"
+normal = "textures/ground_cc0/forrest_ground_01_normal.webp"
+size = 3.2
+terrain = ["plains"]
+land = 6
+saturation = 1.6
+tint = [1.3, 0.6, 0.14]
+
+# Prop kinds: a model each (FBX, relative to the assets folder). `size` scales it on top
+# of 6 model meters per tile; `shadow` is its contact shadow radius in tiles; `sprite`
+# bakes it into a camera-facing sprite when the map loads (trees); `always_drawn` keeps
+# it when the camera zooms out (buildings); `faces_road` turns its front to a road.
+#
+# [[kinds]]
+# name = "alder"
+# model = "models/trees/black_alder.fbx"
+# size = 1.0
+# shadow = 0.4
+# sprite = true
+
+# Placement rules: on which terrain ("plains", "forest", "hills", "mountains", "village",
+# "fields", "road", "water", "bridge"), which kinds (one picked per prop), the share of
+# tiles that get props, how many per tile, how far from the middle (tiles), and ranges
+# for size, height (stretch) and brightness (tint).
+#
+# [[rules]]
+# terrain = "plains"
+# kinds = ["alder"]
+# chance = 0.2
+# per_tile = 1
+# spread = 0.25
+# size = [0.9, 1.3]
+# stretch = [1.0, 1.0]
+# tint = [0.85, 1.0]

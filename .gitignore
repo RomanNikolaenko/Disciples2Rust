@@ -1,1 +1,10 @@
 /target
+
+# Art the game uses when a checkout has it, but whose license does not allow publishing
+# it on its own or is unknown (see each LICENSE.txt): Megascans surfaces (Fab Standard
+# License), the Mixamo character, and two models of unknown license. The game and its
+# tests run without them.
+/assets/textures/ground/
+/assets/models/hero/sword_and_shield_run.fbx
+/assets/models/dragon/
+/assets/models/tree/

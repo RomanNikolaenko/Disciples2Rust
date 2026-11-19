@@ -21,6 +21,7 @@
 //! that fades with the group.
 
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Instant;
 
 use super::background::MenuBackground;
@@ -28,8 +29,9 @@ use super::credits_screen::CreditsScreen;
 use super::screen_flow::{FlowEvent, ScreenFlow, Transition};
 use super::settings_screen::{SettingsEvent, SettingsScreen, WHEEL_LINE};
 use super::widgets::{
-    self, DIALOG_CANCEL, DIALOG_CONFIRM, Dialog, FULL_UV, FlatButton, STONE_BUTTON_GAP,
-    STONE_BUTTON_SIZE, StoneButton, UiKit, palette, scaled,
+    self, DIALOG_CANCEL, DIALOG_CONFIRM, Dialog, FULL_UV, FlatButton, REFERENCE_SIZE,
+    STONE_BUTTON_GAP, STONE_BUTTON_SIZE, StoneButton, UiKit, game_image_material, palette, scaled,
+    ui_scale,
 };
 use crate::engine::render::GpuContext;
 use crate::engine::render::ui_renderer::{SpriteMaterial, TextureSetId, UiFrame, UiRenderer};
@@ -37,10 +39,9 @@ use crate::engine::ui::geometry::Rect;
 use crate::engine::ui::hit::{Hit, topmost_hit};
 use crate::engine::ui::pointer::{PointerPosition, PointerRouter};
 use crate::game::locale::Language;
-use crate::game::settings::{DisplayInfo, DisplaySettings, Settings};
+use crate::game::settings::{DisplayInfo, Settings};
 use crate::game::update::{UpdateState, Updater};
 
-const REFERENCE_SIZE: [f32; 2] = [1920.0, 1080.0];
 const MENU_LEFT: f32 = 110.0;
 /// Top of the main column, so that the column is centered vertically.
 const MENU_TOP: f32 = (REFERENCE_SIZE[1] - column_height()) / 2.0;
@@ -77,12 +78,12 @@ struct ButtonSpec {
     starts_section: bool,
 }
 
-/// New game / Load game stay disabled until there is a game to start or load.
+/// Load game stays disabled until there are saves to load.
 const MAIN_BUTTONS: [ButtonSpec; 5] = [
     ButtonSpec {
         label: "New game",
         command: Command::NewGame,
-        enabled: false,
+        enabled: true,
         starts_section: false,
     },
     ButtonSpec {
@@ -115,6 +116,8 @@ const MAIN_BUTTONS: [ButtonSpec; 5] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuEvent {
     Exit,
+    /// "New game": the menu has faded out; open the world map.
+    NewGame,
     /// An update was installed: start the new version and quit.
     Restart,
     /// The player applied settings: propagate them, and persist them when `save` (a
@@ -135,7 +138,8 @@ const UPDATE_ID: usize = MAIN_BUTTONS.len();
 const UPDATE_DIALOG_ID: usize = 110;
 
 pub struct MainMenu {
-    kit: UiKit,
+    /// Shared with the world map's interface (one upload of the widget art).
+    kit: Rc<UiKit>,
     background: MenuBackground,
     panel: TextureSetId,
     /// Same order as [`MAIN_BUTTONS`].
@@ -167,6 +171,8 @@ pub struct MainMenu {
     scale: f32,
     /// Language the labels currently show; `None` until the first frame sets them.
     shown_language: Option<Language>,
+    /// "New game" was chosen: the fade-out ends in [`MenuEvent::NewGame`], not an exit.
+    starting_game: bool,
 }
 
 impl MainMenu {
@@ -181,7 +187,7 @@ impl MainMenu {
     ) -> Self {
         let (device, queue) = (gpu.device(), gpu.queue());
         let ui_dir = assets_dir.join("ui");
-        let kit = UiKit::load(gpu, renderer, &ui_dir);
+        let kit = Rc::new(UiKit::load(gpu, renderer, &ui_dir));
 
         let background = MenuBackground::load(gpu, renderer, &ui_dir);
         let panel_image = widgets::load_color(
@@ -226,6 +232,7 @@ impl MainMenu {
             viewport: [0.0; 2],
             scale: 1.0,
             shown_language: None,
+            starting_game: false,
         };
         menu.resize(viewport);
         menu
@@ -395,8 +402,12 @@ impl MainMenu {
                             self.focus = Some(EXIT_DIALOG_ID + DIALOG_CONFIRM);
                             tracing::debug!("exit confirmation requested");
                         }
-                        Some(command @ (Command::NewGame | Command::LoadGame)) => {
-                            tracing::info!(?command, "not available yet");
+                        Some(Command::NewGame) => {
+                            self.starting_game = true;
+                            self.flow.request(Transition::Exit);
+                        }
+                        Some(Command::LoadGame) => {
+                            tracing::info!("loading games is not available yet");
                         }
                         None => {}
                     }
@@ -501,6 +512,24 @@ impl MainMenu {
     }
 
     /// The connected monitors were enumerated again.
+    /// The widget art, shared with the world map's interface.
+    pub fn kit(&self) -> Rc<UiKit> {
+        Rc::clone(&self.kit)
+    }
+
+    /// Back from a game: show the main screen again, fading in like at startup.
+    pub fn resume(&mut self) {
+        self.starting_game = false;
+        self.flow = ScreenFlow::new(Screen::Main);
+        self.main_buttons
+            .iter_mut()
+            .for_each(StoneButton::reset_animation);
+        self.update_button.reset_animation();
+        self.router.reset();
+        self.focus = None;
+        self.refresh_hover();
+    }
+
     pub fn set_display_info(&mut self, display: DisplayInfo) {
         self.settings.set_display_info(display);
     }
@@ -577,7 +606,13 @@ impl MainMenu {
                 self.focus = None;
                 self.refresh_hover();
             }
-            FlowEvent::ExitReady => return Some(MenuEvent::Exit),
+            FlowEvent::ExitReady => {
+                return Some(if self.starting_game {
+                    MenuEvent::NewGame
+                } else {
+                    MenuEvent::Exit
+                });
+            }
         }
         if self.flow.current() == Screen::Settings {
             let event = self.settings.update(dt);
@@ -642,7 +677,7 @@ impl MainMenu {
         }
         let [width, height] = self.viewport;
         let full = Rect::new(0.0, 0.0, width, height);
-        let calibration = background_material(
+        let calibration = game_image_material(
             &self
                 .settings
                 .display_preview(self.flow.current() == Screen::Settings),
@@ -791,22 +826,6 @@ fn update_version(state: &UpdateState) -> Option<String> {
     }
 }
 
-/// The background stands in for the game image: brightness and gamma calibrate it
-/// (linear light), while the interface keeps its colors.
-fn background_material(display: &DisplaySettings) -> SpriteMaterial {
-    let factor = display.brightness_factor();
-    SpriteMaterial {
-        tint: [factor, factor, factor, 1.0],
-        gamma: display.gamma_value(),
-        ..SpriteMaterial::PLAIN
-    }
-}
-
-/// Uniform UI scale relative to the 1920x1080 reference.
-fn ui_scale(viewport: [f32; 2]) -> f32 {
-    (viewport[0] / REFERENCE_SIZE[0]).min(viewport[1] / REFERENCE_SIZE[1])
-}
-
 /// The update button (of `size` reference pixels): in the screen's bottom-right corner
 /// with the same gap below and to the right. Anchored to the viewport rather than the
 /// 1920x1080 reference, which stops short of the corner on screens wider or taller than
@@ -851,6 +870,7 @@ fn layout_column(section_starts: impl Iterator<Item = bool>, scale: f32) -> Vec<
 mod tests {
     use super::super::widgets::FLAT_BUTTON_SIZE;
     use super::*;
+    use crate::game::settings::DisplaySettings;
 
     #[test]
     fn scale_follows_the_limiting_axis() {
@@ -886,11 +906,11 @@ mod tests {
     #[test]
     fn calibration_changes_only_the_color() {
         let mut display = DisplaySettings::default();
-        assert_eq!(background_material(&display).tint, [1.0; 4]);
-        assert_eq!(background_material(&display).gamma, 1.0);
+        assert_eq!(game_image_material(&display).tint, [1.0; 4]);
+        assert_eq!(game_image_material(&display).gamma, 1.0);
         display.brightness = 0;
         display.gamma = 220;
-        let material = background_material(&display);
+        let material = game_image_material(&display);
         assert_eq!(material.tint, [0.5, 0.5, 0.5, 1.0], "coverage unchanged");
         assert!((material.gamma - 2.2).abs() < 1e-6);
     }
@@ -913,7 +933,7 @@ mod tests {
             .filter(|b| b.enabled)
             .map(|b| b.label)
             .collect();
-        assert_eq!(enabled, ["Settings", "Credits", "Exit"]);
+        assert_eq!(enabled, ["New game", "Settings", "Credits", "Exit"]);
     }
 
     #[test]

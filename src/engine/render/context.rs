@@ -54,6 +54,8 @@ pub enum FrameStatus {
 pub struct GpuContext {
     window: Arc<Window>,
     instance: wgpu::Instance,
+    /// Kept to answer capability queries (texture format features).
+    adapter: wgpu::Adapter,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -154,6 +156,7 @@ impl GpuContext {
         let mut context = Self {
             window,
             instance,
+            adapter,
             surface,
             device,
             queue,
@@ -211,6 +214,17 @@ impl GpuContext {
 
     pub fn surface_format(&self) -> wgpu::TextureFormat {
         self.config.format
+    }
+
+    /// Whether render targets of every format in `formats` can be multisampled with
+    /// `samples` samples (and color formats resolved), on this adapter.
+    pub fn supports_multisampling(&self, formats: &[wgpu::TextureFormat], samples: u32) -> bool {
+        formats.iter().all(|&format| {
+            let flags = self.adapter.get_texture_format_features(format).flags;
+            let resolvable = format.is_depth_stencil_format()
+                || flags.contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
+            flags.sample_count_supported(samples) && resolvable
+        })
     }
 
     /// Acquires the next surface texture, lets `encode` record the frame's passes, then
